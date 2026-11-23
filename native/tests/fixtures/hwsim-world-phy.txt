@@ -1,0 +1,14 @@
+# Minimal iw phy info excerpt from a world-domain hwsim PHY (2026-11-22).
+	Band 1:
+		HE Iftypes: AP
+		Frequencies:
+			* 2412.0 MHz [1] (20.0 dBm)
+	Band 2:
+		HE Iftypes: AP
+		Frequencies:
+			* 5180.0 MHz [36] (20.0 dBm) (no IR)
+			* 5200.0 MHz [40] (20.0 dBm) (no IR)
+			* 5220.0 MHz [44] (20.0 dBm) (no IR)
+			* 5240.0 MHz [48] (20.0 dBm) (no IR)
+			* 5260.0 MHz [52] (20.0 dBm) (no IR, radar detection)
+			* 5745.0 MHz [149] (20.0 dBm) (no IR)

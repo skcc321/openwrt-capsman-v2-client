@@ -9,80 +9,8 @@ static void cap_vap_ready(int phy, int vapid, int ifindex, const char *ifname,
                           const uint8_t mac[6], const struct cfg *c);
 static void vap_destroy(int port, const struct cfg *c);
 
-static uint32_t ccfi80(uint32_t f)
-{
-    if (f >= 5180 && f <= 5240) return 5210;
-    if (f >= 5260 && f <= 5320) return 5290;
-    if (f >= 5500 && f <= 5560) return 5530;
-    if (f >= 5580 && f <= 5640) return 5610;
-    if (f >= 5660 && f <= 5720) return 5690;
-    if (f >= 5745 && f <= 5805) return 5775;
-    if (f >= 5825 && f <= 5885) return 5855;
-    return f;
-}
-
-/* 0x000A channel-descriptor TLVs for the CREATEVAP-response (0xD00B) body.
-   The manager keeps one row per (frequency, band, width) and echoes the
-   chosen descriptor verbatim in 0x6016.  A profile channel is available
-   only when a descriptor with the profile's band and frequency exists in
-   the width the profile asks for, so every supported combination is
-   emitted.  Widths: 1 = 20, 2 = 40, 3 = 80 MHz; 0x0d is the centre
-   frequency and is required for widths > 20 MHz. */
-static size_t add_chan_desc(uint8_t *b, size_t n, uint32_t freq,
-                            uint8_t width, uint8_t band, uint32_t ccfi)
-{
-    uint8_t sub[48], f[4], c[4];
-    size_t sn = 0;
-    put32(f, freq);
-    sn += put_el(sub + sn, 0x0b, f, 4);
-    sn += put_el(sub + sn, 0x0c, &width, 1);
-    if (width > 1) {
-        put32(c, ccfi);
-        sn += put_el(sub + sn, 0x0d, c, 4);
-    }
-    sn += put_el(sub + sn, 0x10, &band, 1);
-    return n + put_el(b + n, 0x0a, sub, (uint16_t)sn);
-}
-
-/* Centre of the 40 MHz block that contains a 20 MHz primary. */
-static uint32_t c40_for(uint32_t f)
-{
-    if (f < 3000) {
-        if (f + 10 > 2462) return f - 10;   /* top of the band */
-        if (f - 10 < 2412) return f + 10;   /* bottom of the band */
-        return ((((f - 2407) / 5) & 1) ? f + 10 : f - 10);
-    }
-    uint32_t ch = (f - 5000) / 5;
-    return (((ch - 36) % 8) < 4) ? f + 10 : f - 10;
-}
-
-static size_t add_channel_tlvs(uint8_t *b, size_t n, int phy)
-{
-    struct phy_bands pb;
-    read_phy_bands(phy, &pb);
-    for (int i = 0; i < pb.nfreq; i++) {
-        uint32_t f = pb.freq[i];
-        if (f < 3000) {                                   /* 2.4 GHz */
-            n = add_chan_desc(b, n, f, 1, 0x81, f);       /* g  20 */
-            n = add_chan_desc(b, n, f, 1, 0x82, f);       /* n  20 */
-            if (f >= 2412 && f <= 2472)                   /* n  40 */
-                n = add_chan_desc(b, n, f, 2, 0x82, c40_for(f));
-        } else if (f < 5925) {                            /* 5 GHz */
-            n = add_chan_desc(b, n, f, 1, 0x01, f);       /* a  20 */
-            n = add_chan_desc(b, n, f, 1, 0x02, f);       /* n  20 */
-            n = add_chan_desc(b, n, f, 1, 0x03, f);       /* ac 20 */
-            if (f >= 5180 && f <= 5885) {
-                n = add_chan_desc(b, n, f, 2, 0x02, c40_for(f)); /* n 40 */
-                n = add_chan_desc(b, n, f, 2, 0x03, c40_for(f)); /* ac 40 */
-            }
-            if (ccfi80(f) != f)                           /* ac 80 */
-                n = add_chan_desc(b, n, f, 3, 0x03, ccfi80(f));
-        } else {                                          /* 6 GHz */
-            n = add_chan_desc(b, n, f, 1, 0x06, f);
-        }
-    }
-    return n;
-}
+/* Keep the production CREATEVAP wire builder available to host-side tests. */
+#include "channel_reply_wire.inc"
 
 /* Per-radio vapid allocation: the manager never tells the CAP which vapid to
    use, it only sends the (virtual) MAC in TLV 0x08.  We must return a unique
@@ -665,32 +593,20 @@ static void createvap_response(mbedtls_ssl_context *ssl, const uint8_t hdr[10],
     /* Advertise this radio's channels so the stock manager can run chansel. */
     size_t nb = n;
     n = add_channel_tlvs(body, n, phy);   /* returns the absolute offset */
+    if (n == SIZE_MAX) {
+        fprintf(stderr, "d00b: channel descriptors exceed body limit\n");
+        return; /* never send an incomplete capability inventory */
+    }
     size_t nc = n;
 
     /* 0x0061 = current operating frequency (BE32).  The manager stores it in
        phy+0x30 and sets "current freq known" (phy+0x34), which chansel uses. */
-    {
-        uint8_t cf[4];
-        uint32_t hf = curfreq;
-        if (hf) {
-            put32(cf, hf);
-            n += put_el(body + n, 0x61, cf, 4);
-        }
-    }
+    n = add_current_frequency_tlv(body, n, curfreq);
     size_t n61 = n;
 
     /* 0x00B7 = u32 key set used by ActAp::chansel (actman+0x220).  Send the
        same frequency list as BE32 values. */
-    {
-        struct phy_bands pb;
-        uint8_t list[PHY_MAX_FREQ * 4];
-        read_phy_bands(phy, &pb);
-        for (int i = 0; i < pb.nfreq; i++) {
-            uint32_t ch = (pb.freq[i] - chan_base_for_freq(pb.freq[i])) / 5;
-            put32(list + i * 4, ch);
-        }
-        n += put_el(body + n, 0xb7, list, (uint16_t)(pb.nfreq * 4));
-    }
+    n = add_channel_number_tlv(body, n, phy);
 
     if (getenv("CAPAGENT_DEBUG"))
         printf("d00b build base=%zu chan=%zu(delta=%zu) c61=%zu b7=%zu\n",
@@ -705,10 +621,10 @@ static void createvap_response(mbedtls_ssl_context *ssl, const uint8_t hdr[10],
         if (df) { fwrite(body, 1, n, df); fclose(df); }
     }
 
-    uint8_t pkt[BODY_MAX + 16];
-    size_t pn = put_msg(pkt, TYPE_CREATEVAP_RESP, 0, body, (uint16_t)n);
-    memcpy(pkt + 2, hdr, 10);   /* same 10-byte header/sequence */
-    (void)pn;
+    if (n > BODY_MAX) {
+        fprintf(stderr, "d00b: response exceeds body limit\n");
+        return;
+    }
     /* send manually with the custom header */
     uint16_t len = (uint16_t)n;
     uint8_t out[BODY_MAX + 16];

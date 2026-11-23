@@ -1,0 +1,8 @@
+# Selected non-secret rules from the captured `iw reg get` UA domain.
+global
+country UA: DFS-ETSI
+	(2400 - 2483 @ 40), (N/A, 20), (N/A), NO-OUTDOOR
+	(5150 - 5250 @ 80), (N/A, 20), (N/A), NO-OUTDOOR, AUTO-BW
+	(5250 - 5350 @ 80), (N/A, 20), (0 ms), NO-OUTDOOR, DFS, AUTO-BW
+	(5470 - 5725 @ 160), (N/A, 20), (0 ms), NO-OUTDOOR, DFS
+	(5725 - 5850 @ 80), (N/A, 20), (N/A), NO-OUTDOOR

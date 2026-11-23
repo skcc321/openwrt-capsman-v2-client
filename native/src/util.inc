@@ -273,18 +273,61 @@ static const char *phy_name_by_index(int idx, char *buf, size_t n)
     return buf;
 }
 
+/* The iw binary used for PHY/regulatory inventory. CAPAGENT_IW is a
+ * lab/test override, like CAPAGENT_HOSTAPD. */
+static const char *iw_path(void)
+{
+    const char *p = getenv("CAPAGENT_IW");
+    return (p && *p) ? p : "/usr/sbin/iw";
+}
+
+/* Run `iw a1 a2 [a3]` without a shell: neither the iw path nor a wiphy name
+ * is ever parsed as shell syntax. stderr is discarded, as with 2>/dev/null. */
+static FILE *iw_open(const char *a1, const char *a2, const char *a3,
+                     pid_t *pid)
+{
+    int fd[2];
+    if (pipe(fd) != 0) return NULL;
+    *pid = fork();
+    if (*pid == 0) {
+        int nul = open("/dev/null", O_WRONLY);
+        dup2(fd[1], 1);
+        if (nul >= 0) dup2(nul, 2);
+        close(fd[0]);
+        close(fd[1]);
+        execl(iw_path(), "iw", a1, a2, a3, (char *)NULL);
+        _exit(127);
+    }
+    close(fd[1]);
+    FILE *fp = *pid > 0 ? fdopen(fd[0], "r") : NULL;
+    if (!fp) {
+        close(fd[0]);
+        if (*pid > 0) waitpid(*pid, NULL, 0);
+    }
+    return fp;
+}
+
+/* 0 only when iw ran and exited successfully. */
+static int iw_close(FILE *fp, pid_t pid)
+{
+    int st = 0;
+    fclose(fp);
+    if (waitpid(pid, &st, 0) != pid) return -1;
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : -1;
+}
+
 /* Ciphers, chain masks and AP-interface limit from `iw phy phyN info`. */
 static int nl_get_wiphy_ciphers(int phy, uint8_t *out, int outmax);
 
 static void read_phy_caps(int phy, struct phy_caps *pc)
 {
     phy = real_phy(phy);
-    char cmd[128], line[256], pname[32];
+    char line[256], pname[32];
     int in_ciph = 0;
+    pid_t iwpid;
     memset(pc, 0, sizeof(*pc));
     phy_name_by_index(phy, pname, sizeof(pname));
-    snprintf(cmd, sizeof(cmd), "/usr/sbin/iw phy %s info 2>/dev/null", pname);
-    FILE *fp = popen(cmd, "r");
+    FILE *fp = iw_open("phy", pname, "info", &iwpid);
     if (fp) {
         while (fgets(line, sizeof(line), fp)) {
             char *p;
@@ -323,7 +366,7 @@ static void read_phy_caps(int phy, struct phy_caps *pc)
                 }
             }
         }
-        pclose(fp);
+        iw_close(fp, iwpid);
     }
     if (pc->nciphers == 0) {
         int nb = nl_get_wiphy_ciphers(phy, pc->ciphers, 8);
@@ -344,47 +387,47 @@ struct phy_bands {
     int nfreq;
     uint8_t band[8];
     int nband;
+    int he5;
+    uint8_t he5freq[PHY_MAX_FREQ];
+    uint8_t dfs[PHY_MAX_FREQ];
 };
 
 static void iface_chan(const char *ifn, unsigned *freq, unsigned *width);
 
 #include "iw_freq.inc"
+#include "phy_channel_parse.inc"
+static int g_ax_indoor;
 
-/* Supported frequencies/bands of a radio, from `iw phy phyN info`.  Falls
-   back to the legacy 2.4/5 GHz tables only when iw gives nothing. */
+/* AP-eligible frequencies/bands from iw; no synthetic fallback if iw fails. */
 static void read_phy_bands(int phy, struct phy_bands *pb)
 {
     phy = real_phy(phy);
-    char cmd[128], line[256], pname[32];
-    int have2 = 0, have5 = 0, have6 = 0;
+    char pname[32];
+    pid_t iwpid;
+    int ax_ok = 0;
     memset(pb, 0, sizeof(*pb));
     phy_name_by_index(phy, pname, sizeof(pname));
-    snprintf(cmd, sizeof(cmd), "/usr/sbin/iw phy %s info 2>/dev/null", pname);
-    FILE *fp = popen(cmd, "r");
+    FILE *fp = iw_open("phy", pname, "info", &iwpid);
     if (fp) {
-        while (fgets(line, sizeof(line), fp)) {
-            uint32_t f;
-            if (parse_iw_frequency(line, &f)) {
-                int dup = 0;
-                for (int i = 0; i < pb->nfreq; i++)
-                    if (pb->freq[i] == f) dup = 1;
-                if (!dup && pb->nfreq < PHY_MAX_FREQ)
-                    pb->freq[pb->nfreq++] = f;
-            }
-        }
-        pclose(fp);
+        parse_phy_channel_info(fp, pb);
+        ax_ok = iw_close(fp, iwpid) == 0;
+    }
+    /* START re-reads both inventories; a regulatory change fails closed.
+     * AX also needs both iw reads to have completed successfully; a
+     * partial or failed read never authorizes it (legacy is unchanged). */
+    fp = ax_ok ? iw_open("reg", "get", NULL, &iwpid) : NULL;
+    if (fp) {
+        apply_reg_he20(fp, pb, g_ax_indoor, phy);
+        ax_ok = iw_close(fp, iwpid) == 0;
+    } else {
+        ax_ok = 0;
+    }
+    if (!ax_ok) {
+        pb->he5 = 0;
+        memset(pb->he5freq, 0, sizeof(pb->he5freq));
     }
     if (pb->nfreq == 0)
-        fprintf(stderr, "capagent: phy%d reports no frequencies\n", phy);
-    for (int i = 0; i < pb->nfreq; i++) {
-        uint32_t f = pb->freq[i];
-        if (f < 3000) have2 = 1;
-        else if (f < 5925) have5 = 1;
-        else have6 = 1;
-    }
-    if (have2) { pb->band[pb->nband++] = 0x81; pb->band[pb->nband++] = 0x82; }
-    if (have5) { pb->band[pb->nband++] = 0x01; pb->band[pb->nband++] = 0x03; }
-    if (have6) { pb->band[pb->nband++] = 0x06; }
+        fprintf(stderr, "capagent: phy%d reports no AP-eligible frequencies\n", phy);
 }
 
 static uint8_t band_code_for_freq(uint32_t f)
@@ -416,89 +459,8 @@ static uint32_t phy_freq_hint(int phy)
     return 0;
 }
 
-static void build_newphy(uint8_t *b, const uint8_t mac[6], int phy, size_t *out)
-{
-    uint8_t v16[2], v32[4];
-    /* MT7603E/MT7612E support TKIP and CCMP-128 only: no GCMP/GCMP-256 and
-       no CCMP-256.  5ghz-ax is not advertised either (no HE). */
-    struct phy_caps pc;
-    struct phy_bands pb;
-    uint8_t fbuf[PHY_MAX_FREQ * 4];
-    const char *hw = phy_hwtype(phy);
-    size_t n = 0;
-
-    read_phy_bands(phy, &pb);
-    read_phy_caps(phy, &pc);
-    for (int i = 0; i < pb.nfreq; i++)
-        put32(fbuf + i * 4, pb.freq[i]);
-
-    n += put_el(b+n, 0x08, mac, 6);
-
-    /* Interface/peer limits: 8 is the manager-side ceiling we advertise;
-       the driver still enforces its own limit. */
-    if (pc.max_ap > 0) {
-        put16(v16, (uint16_t)pc.max_ap);
-        n += put_el(b+n, 0x7e, v16, 2);
-        n += put_el(b+n, 0x7f, v16, 2);
-        n += put_el(b+n, 0x80, v16, 2);
-    }
-
-    /* 0x83 is a string (hw-type), not the old 8-byte capability blob. */
-    n += put_el(b+n, 0x83, hw, (uint16_t)strlen(hw));
-
-    put32(v32, 1);
-    n += put_el(b+n, 0x8a, v32, 4);
-
-    if (pc.nciphers > 0)
-        n += put_el(b+n, 0x5e, pc.ciphers, (uint16_t)(pc.nciphers * 4));
-    n += put_el(b+n, 0x05, fbuf, (uint16_t)(pb.nfreq * 4));
-
-    if (pc.tx_chain) {
-        put32(v32, pc.tx_chain);
-        n += put_el(b+n, 0x4b, v32, 4);   /* tx chains */
-    }
-    if (pc.rx_chain) {
-        put32(v32, pc.rx_chain);
-        n += put_el(b+n, 0x4c, v32, 4);   /* rx chains */
-    }
-    for (int i = 0; i < pb.nband; i++) {
-        uint8_t bd[5] = { pb.band[i], 0, 0, 0, 0x01 };
-        if (pb.band[i] == 0x82 || pb.band[i] == 0x03) bd[4] = 0x03;
-        if (pb.band[i] == 0x03 || pb.band[i] == 0x06) bd[4] = 0x07;
-        n += put_el(b+n, 0x4d, bd, 5);
-    }
-
-    /* WiFi 6/7 band ids, only when the phy reports HE/EHT AP support. */
-    {
-        int have5 = 0, have6 = 0;
-        for (int i = 0; i < pb.nfreq; i++) {
-            if (pb.freq[i] >= 4900 && pb.freq[i] < 5925) have5 = 1;
-            if (pb.freq[i] >= 5925) have6 = 1;
-        }
-        if (have5 && pc.has_he) {
-            uint8_t bd[5] = { 0x04, 0, 0, 0, 0x07 };
-            n += put_el(b+n, 0x4d, bd, 5);
-        }
-        if (have5 && pc.has_eht) {
-            uint8_t bd[5] = { 0x06, 0, 0, 0, 0x07 };
-            n += put_el(b+n, 0x4d, bd, 5);
-        }
-        if (have6 && pc.has_eht) {
-            uint8_t bd[5] = { 0x06, 0, 0, 0, 0x07 };
-            n += put_el(b+n, 0x4d, bd, 5);
-        }
-    }
-
-    /* 0x84 = little-endian capability bitset.  Bit 6 (0x40) tells the
-       manager the CAP supports the data channel; without it a
-       datapath.traffic-processing=on-capsman VAP is refused with
-       "data channel not supported".  Keep bit 7 (MLO) clear. */
-    {
-        uint8_t caps84[4] = { 0x40, 0x00, 0x00, 0x00 };
-        n += put_el(b+n, 0x84, caps84, sizeof(caps84));
-    }
-    *out = n;
-}
+/* Same serializer is compiled by the host-side channel regression tests. */
+#include "newphy_wire.inc"
 
 static int find_el(const uint8_t *b, size_t n, uint16_t id,
                    const uint8_t **val, uint16_t *len)
