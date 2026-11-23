@@ -167,6 +167,10 @@ static void extmux_del_vap(void *m, uint16_t port)
 }
 static void pmap_del(int port) { (void)port; }
 static void dp_del_ifindex(int ifindex) { (void)ifindex; }
+/* The stubbed hostapd above is never a direct child of this test. */
+struct vap_child;
+static struct vap_child *vap_child_by_pid(pid_t pid) { (void)pid; return NULL; }
+static int vap_child_stop(struct vap_child *child) { (void)child; return 1; }
 static size_t parse_hex(const char *s, uint8_t *out, size_t max)
 {
     size_t n = 0;

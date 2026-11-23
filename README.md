@@ -90,6 +90,52 @@ provisioned by the same manager as MikroTik hardware.
 * config push (`0x6016`) with SSID, RSN IE and channel
 * split-MAC option: manager-side 802.1X/RSN, EAPOL relay and key install
 
+## Wi-Fi 6 (802.11ax) — Experimental CAPsMAN v2 support
+
+These **stacked, unmerged contributions** add 5 GHz AX support without
+changing the reference Xiaomi/MT7612E status above:
+
+* [PR #1](https://github.com/DarkNikGr/openwrt-capsman-v2-client/pull/1)
+  improves `iw` frequency parsing; it does not add AX provisioning.
+* [PR #2](https://github.com/skcc321/openwrt-capsman-v2-client/pull/2)
+  builds on PR #1 with regulatory-aware **HE20** advertisement and START.
+* **PR #3** (this local, not-yet-published branch, stacked on PR #2)
+  adds **HE40 and HE80** only when the PHY capabilities, every constituent
+  20 MHz channel, the primary/center frequencies and the global and
+  per-PHY regulatory rules agree. The same eligibility gate checks the
+  advertised channel and the manager's START.
+
+In controlled tests against a **real RouterOS 7.25.1 RB5009** and an
+isolated Linux **mac80211_hwsim** CAP, the manager selected HE20 at
+5180 MHz (20 MHz), HE40 at 5180/40 MHz (center 5190 MHz), and HE80
+at 5180/80 MHz (center 5210 MHz). HE40/HE80 reached hostapd
+`AP-ENABLED` and produced matching HT/VHT/HE virtual beacons;
+the HE20 live result used an earlier tested PR #2 revision. Channel
+width and center are checked against the PHY, legal constituent
+channels and the selected START; wrong centers and unsupported
+widths are rejected. Indoor-only Ukrainian W52 channels require
+`--indoor`; AX no-IR and DFS/CAC channels are deliberately excluded,
+not bypassed. This is a limited 5 GHz, non-DFS virtual-radio
+integration, not general Wi-Fi 6 hardware qualification.
+
+Reproduction and scope: [HE20 PR #2 test details](https://github.com/skcc321/openwrt-capsman-v2-client/pull/2),
+[HE40/HE80 review and offline matrix](docs/PR3-HE40-HE80-REVIEW.md),
+and [`native/tests/`](native/tests/) wire/START/hwsim regressions
+(`test_channel_wire.c`, `test_start_offline.c`, `run_he_wide_hwsim.py`).
+Timestamped private live captures and rollback reports are preserved
+separately under `capsman_discovery/` (not included in this repository).
+For the HE40/HE80 sessions the START ACK **success path** was reached,
+but its TLS transport write was not instrumented and manager receipt
+is unconfirmed; the subsequent manager status poll does not prove
+ACK receipt.
+
+**Not validated by these live tests:** physical Xiaomi AX3000/ath11k,
+the reference MT7612E's unresolved full hardware run, WPA2/WPA3
+client association, VLAN forwarding, roaming, zero-touch provisioning,
+physical RF or sustained post-ACK AP availability. See
+[`docs/OPEN-PROBLEMS.md`](docs/OPEN-PROBLEMS.md) for the existing
+hardware and factory-reset investigations.
+
 ## Architecture at a glance
 
 ```

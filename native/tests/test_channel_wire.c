@@ -23,6 +23,8 @@ struct phy_bands {
     int nband;
     int he5;
     uint8_t he5freq[PHY_MAX_FREQ];
+    uint8_t he5wide[PHY_MAX_FREQ];
+    uint8_t he5wideband[PHY_MAX_FREQ];
     uint8_t dfs[PHY_MAX_FREQ];
 };
 #include "../src/iw_freq.inc"
@@ -130,6 +132,8 @@ static void reset_fixture(int he)
     fixture_caps.has_he = he;
     fixture_bands.he5 = he;
     if (he) memset(fixture_bands.he5freq, 1, sizeof(fixture_bands.he5freq));
+    if (he) memset(fixture_bands.he5wideband, 1,
+                   sizeof(fixture_bands.he5wideband));
 }
 
 static void check_small(int he)
@@ -257,6 +261,57 @@ static void check_mixed_phy(void)
     size_t total = add_channel_number_tlv(reply, cn, 0);
     assert(rd16(reply + cn) == 0xb7);
     assert(next(reply, total, cn) == total);
+}
+
+static void check_ax_wide(void)
+{
+    static const uint8_t he40[] = {
+        0x00,0x0a,0x00,0x1a, 0x00,0x0b,0x00,0x04,0x00,0x00,0x14,0x3c,
+        0x00,0x0c,0x00,0x01,0x02, 0x00,0x0d,0x00,0x04,0x00,0x00,0x14,0x46,
+        0x00,0x10,0x00,0x01,0x04
+    };
+    static const uint8_t he80[] = {
+        0x00,0x0a,0x00,0x1a, 0x00,0x0b,0x00,0x04,0x00,0x00,0x14,0x3c,
+        0x00,0x0c,0x00,0x01,0x03, 0x00,0x0d,0x00,0x04,0x00,0x00,0x14,0x5a,
+        0x00,0x10,0x00,0x01,0x04
+    };
+    uint8_t wire[BODY_MAX], np[1024], mac[6] = {0x02};
+    size_t nn;
+    reset_fixture(1);
+    for (uint32_t f = 5180; f <= 5240; f += 20)
+        fixture_bands.freq[fixture_bands.nfreq++] = f;
+    memset(fixture_bands.he5wide, 7, sizeof(fixture_bands.he5wide));
+    build_newphy(np, mac, 0, &nn);
+    assert(band_mask(np, nn, 0x04) == 7);
+    size_t n = add_channel_tlvs(wire, 0, 0);
+    assert(n != SIZE_MAX);
+    assert(count_channel(wire, n, 5180, 0x04, 2, 5190) == 1);
+    assert(count_channel(wire, n, 5180, 0x04, 3, 5210) == 1);
+    int found40 = 0, found80 = 0;
+    for (size_t i = 0; i < n; i = next(wire, n, i)) {
+        if (next(wire, n, i) - i == sizeof(he40) &&
+            !memcmp(wire + i, he40, sizeof(he40))) found40++;
+        if (next(wire, n, i) - i == sizeof(he80) &&
+            !memcmp(wire + i, he80, sizeof(he80))) found80++;
+    }
+    assert(found40 == 1 && found80 == 1);
+    assert(!ax_channel_ok(&fixture_bands, &fixture_caps, 5180, 2, 5210));
+    assert(!ax_channel_ok(&fixture_bands, &fixture_caps, 5180, 3, 5190));
+    assert(!ax_channel_ok(&fixture_bands, &fixture_caps, 5180, 4, 5210));
+    fixture_bands.he5wide[1] = 0;
+    build_newphy(np, mac, 0, &nn);
+    assert(band_mask(np, nn, 0x04) == 3); /* second pair remains */
+    n = add_channel_tlvs(wire, 0, 0);
+    assert(!count_channel(wire, n, 5180, 0x04, 2, 5190));
+    assert(!count_channel(wire, n, 5180, 0x04, 3, 5210));
+    assert(count_channel(wire, n, 5180, 0x04, 1, 0));
+    fixture_bands.he5wide[1] = 7;
+    fixture_bands.he5freq[3] = 0; /* no-IR/DFS constituent */
+    build_newphy(np, mac, 0, &nn);
+    assert(band_mask(np, nn, 0x04) == 3);
+    n = add_channel_tlvs(wire, 0, 0);
+    assert(!count_channel(wire, n, 5180, 0x04, 3, 5210));
+    assert(count_channel(wire, n, 5180, 0x04, 2, 5190));
 }
 
 static void check_ax20_only(void)
@@ -502,6 +557,66 @@ static void check_reg_he20(const char *reg)
     assert(cc[0] == 0);
 }
 
+static void check_reg_wide(void)
+{
+    static const char phy[] =
+        " Band 1:\n\tCapabilities: 0x1234\n\t\tHT20/HT40\n"
+        "\tVHT Capabilities (0x1234):\n\tHE Iftypes: AP\n"
+        "\t\tHE PHY Capabilities: (0x04)\n"
+        "\t* 5180 MHz [36] (20.0 dBm)\n"
+        "\t* 5200 MHz [40] (20.0 dBm)\n"
+        "\t* 5220 MHz [44] (20.0 dBm)\n"
+        "\t* 5240 MHz [48] (20.0 dBm)\n";
+    static const char rules[] =
+        "global\ncountry UA: DFS-ETSI\n"
+        "\t(5150 - 5250 @ 80), (N/A, 20), (N/A), NO-OUTDOOR\n";
+    parse_text(phy);
+    apply_reg_file(text_file(rules), 1, 0);
+    assert(fixture_bands.he5wide[0] == 5); /* HT40+ and HE80 */
+    fixture_caps.has_he = 1;
+    assert(ax_channel_ok(&fixture_bands, &fixture_caps, 5180, 2, 5190));
+    assert(ax_channel_ok(&fixture_bands, &fixture_caps, 5180, 3, 5210));
+    parse_text(phy);
+    apply_reg_file(text_file("global\n\t(5150 - 5250 @ 40), (N/A, 20)\n"),
+                   1, 0);
+    assert(ax_channel_ok(&fixture_bands, &fixture_caps, 5180, 2, 5190));
+    assert(!ax_channel_ok(&fixture_bands, &fixture_caps, 5180, 3, 5210));
+    parse_text(phy);
+    apply_reg_file(text_file("global\n\t(5150 - 5250 @ 80), (N/A, 20), "
+                             "(N/A), NO-HT40PLUS, NO-80MHZ\n"), 1, 0);
+    assert(!ax_channel_ok(&fixture_bands, &fixture_caps, 5180, 2, 5190));
+    assert(!ax_channel_ok(&fixture_bands, &fixture_caps, 5180, 3, 5210));
+    assert(ax_channel_ok(&fixture_bands, &fixture_caps, 5180, 1, 0));
+    parse_text(phy);
+    apply_reg_file(text_file("global\ncountry UA: DFS-ETSI\n"
+                             "\t(5150 - 5250 @ 80), (N/A, 20), "
+                             "(N/A), NO-OUTDOOR\n"
+                             "phy#0\ncountry US:\n"
+                             "\t(5150 - 5250 @ 20), (N/A, 20)\n"), 1, 0);
+    assert(!ax_channel_ok(&fixture_bands, &fixture_caps, 5180, 2, 5190));
+    parse_text(phy);
+    apply_reg_file(text_file("global\n\t(5170 - 5190 @ 80), (N/A, 20)\n"
+                             "\t(5190 - 5250 @ 80), (N/A, 20)\n"), 1, 0);
+    assert(!ax_channel_ok(&fixture_bands, &fixture_caps, 5180, 2, 5190));
+    parse_text(phy);
+    apply_reg_file(text_file(rules), 0, 0);
+    assert(!fixture_bands.he5);
+    parse_text(" Band 1:\n\tHE Iftypes: AP\n"
+               "\tHE PHY Capabilities: (0x00)\n"
+               "\t* 5180 MHz [36] (20.0 dBm)\n"
+               "\t* 5200 MHz [40] (20.0 dBm)\n");
+    apply_reg_file(text_file(rules), 1, 0);
+    assert(!fixture_bands.he5wide[0]);
+    parse_text(" Band 1:\n\tHT20/HT40\n\tVHT Capabilities (0x1):\n"
+               "\tHE Iftypes: AP\n\tHE PHY Capabilities: (0x04)\n"
+               "\t* 5180 MHz [36] (20.0 dBm)\n"
+               " Band 2:\n\tHT20/HT40\n\tVHT Capabilities (0x1):\n"
+               "\tHE Iftypes: AP\n\tHE PHY Capabilities: (0x04)\n"
+               "\t* 5200 MHz [40] (20.0 dBm)\n");
+    apply_reg_file(text_file(rules), 1, 0);
+    assert(!ax_channel_ok(&fixture_bands, &fixture_caps, 5180, 2, 5190));
+}
+
 static void check_band_scope_and_bounds(void)
 {
     parse_text(" Band 1:\n\tHE Iftypes: AP\n"
@@ -689,6 +804,7 @@ int main(int argc, char **argv)
     check_small(1);
     check_mixed_phy();
     check_ax20_only();
+    check_ax_wide();
     check_captured_start_channel();
     check_hwsim_frequency_inventory();
     check_limits();
@@ -697,7 +813,19 @@ int main(int argc, char **argv)
     check_start_descriptor();
     check_start_policy();
     check_reg_he20("tests/fixtures/ua-reg-he20.txt");
+    check_reg_wide();
     if (argc == 3) check_real_iw(argv[1], argv[2]);
+    if (argc == 5) {
+        FILE *fp = fopen(argv[3], "r");
+        assert(fp);
+        parse_phy_channel_info(fp, &fixture_bands);
+        fclose(fp);
+        apply_reg_file(fopen(argv[4], "r"), 1, 0);
+        fixture_caps.has_he = 1;
+        assert(ax_channel_ok(&fixture_bands, &fixture_caps, 5180, 2, 5190));
+        assert(ax_channel_ok(&fixture_bands, &fixture_caps, 5180, 3, 5210));
+        assert(!ax_channel_ok(&fixture_bands, &fixture_caps, 5260, 2, 5270));
+    }
     puts("channel wire: captured 2.4 GHz, hwsim HE, ordering and limits PASS");
     return 0;
 }

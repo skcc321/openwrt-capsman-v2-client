@@ -1,4 +1,6 @@
 /* NEWPHY wire builder; included from util.inc after the PHY readers. */
+static int ax_channel_ok(const struct phy_bands *, const struct phy_caps *,
+                         uint32_t, uint8_t, uint32_t);
 static void build_newphy(uint8_t *b, const uint8_t mac[6], int phy, size_t *out)
 {
     uint8_t v16[2], v32[4];
@@ -57,7 +59,16 @@ static void build_newphy(uint8_t *b, const uint8_t mac[6], int phy, size_t *out)
             if (pb.freq[i] >= 4900 && pb.freq[i] < 5925) have5 = 1;
         }
         if (have5 && pb.he5 && pc.has_he) {
-            uint8_t bd[5] = { 0x04, 0, 0, 0, 0x01 }; /* HE20 only */
+            uint8_t mask = 1;
+            /* Derive the band mask from the very same START/descriptor
+             * predicate, never from a PHY-wide HE capability alone. */
+            for (int i = 0; i < pb.nfreq; i++) {
+                uint32_t f = pb.freq[i], c40, c80;
+                if (!he_wide_centers(f, &c40, &c80)) continue;
+                if (ax_channel_ok(&pb, &pc, f, 2, c40)) mask |= 2;
+                if (ax_channel_ok(&pb, &pc, f, 3, c80)) mask |= 4;
+            }
+            uint8_t bd[5] = { 0x04, 0, 0, 0, mask };
             n += put_el(b+n, 0x4d, bd, 5);
         }
     }
