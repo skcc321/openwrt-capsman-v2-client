@@ -24,9 +24,16 @@
  */
 
 #define VAP_CONF_DIR "/tmp"
+#ifndef VAP_START_LOCK                /* tests point this at a temp path */
+#define VAP_START_LOCK "/var/run/cap-vap-start.lock"
+#endif
+#ifndef VAP_RUN_DIR                   /* hostapd pid files; tests override */
+#define VAP_RUN_DIR "/var/run"
+#endif
 
-/* Regulatory country for hostapd.  CAPsMAN v2 does not deliver it in 0x500b or
- * 0x6016, so it is a CAP setting (--country / COUNTRY= in the config).  Empty
+/* Regulatory country for hostapd. No country value is decoded from 0x500b or
+ * 0x6016; wire-level propagation is unproven. The CAP can set its own
+ * country (--country / COUNTRY= in the config). Empty
  * means "do not program a country": 5 GHz will then only come up if something
  * else already set the regdomain. */
 static const char *g_vap_country;
@@ -194,19 +201,8 @@ static int wireless_has_bss(void)
     return wl_legacy();
 }
 
-/* 0x0c width code from the manager: 1=20, 2=40, 3=80, 4=160. */
-static int vap_mgr_width(const uint8_t *chv, uint16_t cl)
-{
-    size_t p = 0;
-    while (p + 4 <= cl) {
-        uint16_t t = rd16(chv + p), l = rd16(chv + p + 2);
-        p += 4;
-        if (p + l > cl) break;
-        if (t == 0x0c && l == 1) return chv[p];
-        p += l;
-    }
-    return 0;
-}
+/* START descriptor decoding shared with the wire-format regression tests. */
+#include "start_channel_wire.inc"
 
 static int vap_is_5g(uint32_t f) { return f >= 4900 && f <= 5925; }
 
@@ -231,8 +227,12 @@ static int vap_ht40_sign5(uint32_t freq)
 static void vap_write_channel(FILE *f, uint32_t freq, int wcode)
 {
     if (!vap_is_5g(freq)) {
-        int chan = (int)((freq - 2407) / 5);
+        int chan = freq == 2484 ? 14 : (int)((freq - 2407) / 5);
         if (chan < 1 || chan > 14) chan = 6;
+        if (freq == 2484) {
+            fprintf(f, "hw_mode=b\nchannel=14\n");
+            return;
+        }
         int width = (wcode == 2 || wcode == 3) ? 40 : 20;
         fprintf(f, "hw_mode=g\nchannel=%d\nieee80211n=1\n", chan);
         if (width == 40) {
@@ -248,7 +248,7 @@ static void vap_write_channel(FILE *f, uint32_t freq, int wcode)
     case 1:  width = 20; break;
     case 2:  width = 40; break;
     case 3:  width = 80; break;
-    default: width = 80; break;
+    default: width = 20; break;
     }
 
     fprintf(f, "hw_mode=a\nchannel=%d\n", chan);
@@ -285,27 +285,64 @@ static void vap_write_channel(FILE *f, uint32_t freq, int wcode)
     }
 }
 
-/* Program the regulatory domain once, before the first hostapd.  CAPsMAN v2
- * does not deliver a country, so it is a CAP setting (--country/COUNTRY=).
- * hostapd's own country_code makes it wait in COUNTRY_UPDATE for a regdomain
- * event that may never arrive when another interface already set the same
- * country; doing it here keeps the per-BSS start deterministic. */
-static int vap_set_regdomain(void)
+/* Tests replace the kernel request; production sends NL80211_CMD_REQ_SET_REG. */
+#ifndef CAP_REQ_SET_REG
+#define CAP_REQ_SET_REG vap_req_set_reg
+static int vap_req_set_reg(const char *cc)
 {
-    static int done;
-    if (done) return 0;
-    done = 1;
-    if (!g_vap_country || !g_vap_country[0]) return 0;
     if (nl_cmd_open() != 0) return -1;
     struct nl_buf m;
     nlb_init(&m, NL80211_CMD_REQ_SET_REG, NLM_F_ACK);
-    nlb_put(&m, NL80211_ATTR_REG_ALPHA2, g_vap_country,
-            strlen(g_vap_country) + 1);
-    int rc = nl_send_ack(g_nl_cmd_fd, &m);
+    nlb_put(&m, NL80211_ATTR_REG_ALPHA2, cc, strlen(cc) + 1);
+    return nl_send_ack(g_nl_cmd_fd, &m);
+}
+#endif
+
+/* Program the CAP-configured regulatory domain before NEWPHY and the first
+ * hostapd. hostapd's own country_code makes it wait in COUNTRY_UPDATE for a
+ * regdomain event that may never arrive when another interface already set
+ * the same country; doing it here keeps the per-BSS start deterministic.
+ * A failed request is retried on the next session or START. */
+static int vap_set_regdomain(void)
+{
+    static int done;
+    if (done || !g_vap_country || !g_vap_country[0]) return 0;
+    int rc = CAP_REQ_SET_REG(g_vap_country);
+    if (rc == -EALREADY) rc = 0;
     printf("vap: regulatory country=%s %s\n", g_vap_country,
            rc ? strerror(rc < 0 ? -rc : rc) : "set");
     fflush(stdout);
+    if (!rc) done = 1;
     return rc;
+}
+
+/* NEWPHY and CREATEVAP advertise cfg80211's current domain. A CAP booted in
+ * world domain 00 sees 5 GHz as no-IR, so apply the CAP's own country first
+ * (CAPsMAN v2 has not been shown to carry one) and wait, bounded, for the
+ * asynchronous hint to become the global domain. Restrictions still come
+ * only from the kernel; nothing is advertised that it does not permit. */
+static int vap_regulatory_bootstrap(void)
+{
+    static int waited;              /* reconnects must not repeat the wait */
+    char cc[3];
+    pid_t iwpid;
+    if (!wl_own() || !g_vap_country || !g_vap_country[0]) return 0;
+    if (vap_set_regdomain() != 0) return -1;
+    if (waited) return 0;
+    waited = 1;
+    for (int i = 0; i < 30; i++) {
+        FILE *fp = iw_open("reg", "get", NULL, &iwpid);
+        cc[0] = 0;
+        if (fp) {
+            reg_global_country(fp, cc);
+            if (iw_close(fp, iwpid) != 0) cc[0] = 0;
+        }
+        if (!strcasecmp(cc, g_vap_country)) return 0;
+        usleep(100000);
+    }
+    fprintf(stderr, "vap: country %s not active after 3 s; advertising the "
+            "current regulatory domain\n", g_vap_country);
+    return -1;
 }
 
 /* Create an AP netdev on the wiphy.  Returns the ifindex or <= 0. */
@@ -404,23 +441,29 @@ static int vap_hostapd_start_one(int port, const char *ifname, int phy, int vapi
                                  const uint8_t *body, uint16_t len,
                                  struct vap *vp, const struct cfg *c)
 {
-    const uint8_t *ssid = NULL, *ie = NULL, *chv = NULL;
-    uint16_t sl = 0, il = 0, cl = 0;
+    const uint8_t *ssid = NULL, *ie = NULL;
+    uint16_t sl = 0, il = 0;
     if (!find_el(body, len, 0x03, &ssid, &sl) || sl == 0) return -1;
     find_el(body, len, 0x04, &ie, &il);
-    find_el(body, len, 0x0a, &chv, &cl);
 
     struct rsn_info ri;
     rsn_parse(ie, il, &ri);
 
-    uint32_t freq = 0;
-    vchan_get(port, &freq, NULL, NULL);
-    if (!freq) freq = vp ? vp->freq : 0;
-    if (!freq) return -1;
+    struct phy_bands pb;
+    struct phy_caps pc;
+    struct start_channel ch;
+    read_phy_bands(phy, &pb);
+    read_phy_caps(phy, &pc);
+    if (!start_channel_validate(body, len, &pb, &pc, &ch)) {
+        fprintf(stderr, "vap: reject invalid START channel port=0x%04x\n", port);
+        return -1;
+    }
+    uint32_t freq = ch.freq;
+    int ax = ch.band == 0x04;
 
     char path[128], pidf[128], logf[128];
     snprintf(path, sizeof(path), VAP_CONF_DIR "/vap-%s.conf", ifname);
-    snprintf(pidf, sizeof(pidf), "/var/run/vap-%s.pid", ifname);
+    snprintf(pidf, sizeof(pidf), "%s/vap-%s.pid", VAP_RUN_DIR, ifname);
     snprintf(logf, sizeof(logf), "/tmp/vap-%s.log", ifname);
 
     char bridge[32] = "";
@@ -442,7 +485,8 @@ static int vap_hostapd_start_one(int port, const char *ifname, int phy, int vapi
                 vp->bssid[4], vp->bssid[5]);
     }
     if (bridge[0]) fprintf(f, "bridge=%s\n", bridge);
-    vap_write_channel(f, freq, vap_mgr_width(chv, cl));
+    vap_write_channel(f, freq, ch.width);
+    if (ax) fprintf(f, "ieee80211ax=1\nhe_oper_chwidth=0\n");
 
     int have_psk = ri.valid && (ri.akm_psk || ri.akm_psk256);
     int have_sae = ri.valid && (ri.akm_sae || ri.akm_owe) &&
@@ -591,15 +635,18 @@ static int vap_hostapd_start_one(int port, const char *ifname, int phy, int vapi
            vp ? vp->vlan : 0, hpid);
     fflush(stdout);
     if (vp) vp->hostapd_started_at = time(NULL);
-    return hpid > 0 ? hpid : -1;
+    if (hpid <= 0) return -1;
+    /* The BSS is on air with this validated descriptor, whether a 0x6016 or
+     * an automatic retry from the journal started it: record that channel. */
+    vchan_set(port, ch.freq, ch.width, ch.band);
+    return hpid;
 }
 
 static int vap_hostapd_start(int port, const char *ifname, int phy, int vapid,
                              const uint8_t *body, uint16_t len,
                              struct vap *vp, const struct cfg *c)
 {
-    int lockfd = open("/var/run/cap-vap-start.lock",
-                      O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+    int lockfd = open(VAP_START_LOCK, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
     if (lockfd >= 0) flock(lockfd, LOCK_EX);
     int r = vap_hostapd_start_one(port, ifname, phy, vapid, body, len, vp, c);
     if (lockfd >= 0) {
@@ -620,7 +667,7 @@ static int vap_hostapd_pid(const char *ifname)
     FILE *pf;
     int found = 0;
 
-    snprintf(pidf, sizeof(pidf), "/var/run/vap-%s.pid", ifname);
+    snprintf(pidf, sizeof(pidf), "%s/vap-%s.pid", VAP_RUN_DIR, ifname);
     pf = fopen(pidf, "r");
     if (!pf) return 0;
     if (fscanf(pf, "%ld", &pid) != 1) pid = 0;
@@ -690,7 +737,7 @@ static void vap_paths(const char *ifname, char *conf, size_t cl,
                       char *pidf, size_t pl)
 {
     snprintf(conf, cl, VAP_CONF_DIR "/vap-%s.conf", ifname);
-    snprintf(pidf, pl, "/var/run/vap-%s.pid", ifname);
+    snprintf(pidf, pl, "%s/vap-%s.pid", VAP_RUN_DIR, ifname);
 }
 
 static int vap_pid_alive(pid_t pid)
@@ -947,20 +994,21 @@ static int vap_refresh_ifindex(int port, uint8_t mac[6], int *changed)
 /* Called from the 0x6016 handler.  Resolves the netdev, registers the port,
  * journals the request and (only when the ownership table says ours) starts
  * hostapd.  netifd-owned names are read-only. */
-static void vap_provision(int port, const uint8_t *body, uint16_t len,
-                          const struct cfg *c)
+static int vap_provision(int port, const uint8_t *body, uint16_t len,
+                         const struct cfg *c, const struct start_channel *ch)
 {
     /* Hard gate: when netifd (legacy UCI or any other owner) owns the
      * BSSes we must never create, start or touch one, even if the
      * manager asks.  This is the read-only contract. */
-    if (wl_legacy()) return;
+    if (wl_legacy()) return start_should_ack(1, 0, 0, 0);
+    int observer = !c->vap_auto;
     int phy = (port >> 8) & 0xff;
     int vapid = port & 0xff;
     vap_set_regdomain();
     if (phy >= MAX_RADIOS || vapid > 15) {
         fprintf(stderr, "vap: 0x6016 for invalid port 0x%04x, ignored\n", port);
         fflush(stderr);
-        return;
+        return start_should_ack(observer, 0, 0, 0);
     }
     struct vap *vp = &g_vap[phy % MAX_RADIOS][vapid];
     const uint8_t *ie = NULL;
@@ -978,7 +1026,7 @@ static void vap_provision(int port, const uint8_t *body, uint16_t len,
                managed ? "ours" : "netifd/foreign/forced-legacy");
         fflush(stdout);
         own_note_start(c, port, body, len, vp, 0, 0);
-        return;
+        return start_should_ack(observer, 0, managed, 0);
     }
     vp->used = 1;
     vp->rid = phy;
@@ -1005,7 +1053,7 @@ static void vap_provision(int port, const uint8_t *body, uint16_t len,
                "no hostapd\n", ifname);
         fflush(stdout);
         own_note_start(c, port, body, len, vp, ifindex, 0);
-        return;
+        return start_should_ack(observer, 1, 0, 0);
     }
 
     /* W36: this VAP runs its MLME in-process; never spawn hostapd for it. */
@@ -1014,7 +1062,33 @@ static void vap_provision(int port, const uint8_t *body, uint16_t len,
         if (mr < 0)
             fprintf(stderr, "vap: %s in-CAP MLME failed (%d)\n", ifname, mr);
         own_note_start(c, port, body, len, vp, ifindex, 0);
-        return;
+        return start_should_ack(observer, 1, 1, mr >= 0);
+    }
+
+    /* own_note_start keeps a running daemon and only journals the newest
+     * body. A repeated START asking for another channel, width or HE mode
+     * would then be acknowledged for a BSS that is not on air, and a later
+     * restart would silently switch. Refuse it before journaling. */
+    if (ch && !observer && vap_hostapd_running(ifname)) {
+        char conf[128], pidf[128], cl[64];
+        unsigned rf = 0, rw = 0;
+        int ax = -1;
+        iface_chan(ifname, &rf, &rw);
+        vap_paths(ifname, conf, sizeof(conf), pidf, sizeof(pidf));
+        FILE *cf = fopen(conf, "r");
+        if (cf) {
+            ax = 0;
+            while (fgets(cl, sizeof(cl), cf))
+                if (!strcmp(cl, "ieee80211ax=1\n")) ax = 1;
+            fclose(cf);
+        }
+        if (start_conflicts_running(ch, rf, rw, ax)) {
+            printf("vap: %s running on %u MHz/%u MHz ax=%d; START for %u "
+                   "width=%u band=0x%02x not applied\n", ifname, rf, rw, ax,
+                   ch->freq, ch->width, ch->band);
+            fflush(stdout);
+            return 0;
+        }
     }
 
     /* Let own_note_start decide: an identical repeated 0x6016 is ignored, a
@@ -1025,6 +1099,7 @@ static void vap_provision(int port, const uint8_t *body, uint16_t len,
     vp->hostapd_pid = vap_hostapd_pid(ifname);
     vp->hostapd_started = vp->hostapd_pid > 0;
     if (vp->hostapd_started) vp->ap_started = 1;
+    return start_should_ack(observer, 1, 1, vp->hostapd_started);
 }
 
 /* 0x600c destroy.  Always ack, always release our bookkeeping (the vapid

@@ -33,6 +33,17 @@ CC     := $(CROSS)gcc
 STRIP  := $(CROSS)strip
 QEMU   ?= qemu-mipsel
 HOSTCC ?= cc
+# Host mbedTLS 3.x (with CCM) for start-offline-test: a static prefix, or the
+# system libraries when HOST_MBEDTLS is empty.
+HOST_MBEDTLS ?=
+ifneq ($(HOST_MBEDTLS),)
+HOST_MBEDTLS_CFLAGS := -I$(HOST_MBEDTLS)/include
+HOST_MBEDTLS_LIBS   := $(HOST_MBEDTLS)/lib/libmbedtls.a \
+                       $(HOST_MBEDTLS)/lib/libmbedx509.a \
+                       $(HOST_MBEDTLS)/lib/libmbedcrypto.a
+else
+HOST_MBEDTLS_LIBS   := -lmbedtls -lmbedx509 -lmbedcrypto
+endif
 
 W34_TEST_DIR := $(CURDIR)/.w34-tests
 W53_TEST_DIR := $(CURDIR)/.w53-tests
@@ -70,7 +81,8 @@ w34-tests:
 	    -o $(W34_TEST_DIR)/test_netifd_status ../tests/test_netifd_status.c
 	$(QEMU) $(W34_TEST_DIR)/test_netifd_status
 
-check: capagent-mipsel w34-tests extmux-test iw-freq-test
+check: capagent-mipsel w34-tests extmux-test iw-freq-test \
+       channel-wire-test start-offline-test
 	$(QEMU) ./capagent-mipsel --crypto-selftest
 	$(QEMU) ./capagent-mipsel --selftest-policy
 
@@ -89,8 +101,30 @@ iw-freq-test: tests/test_iw_freq.c src/iw_freq.inc
 	    tests/test_iw_freq.c
 	$(W53_TEST_DIR)/test_iw_freq
 
+channel-wire-test: tests/test_channel_wire.c tests/fixtures/ua-reg-he20.txt \
+                   src/iw_freq.inc src/newphy_wire.inc \
+                   src/channel_reply_wire.inc src/phy_channel_parse.inc \
+                   src/start_channel_wire.inc
+	mkdir -p $(W53_TEST_DIR)
+	$(HOSTCC) -O2 -Wall -Wextra -Werror -o $(W53_TEST_DIR)/test_channel_wire \
+	    tests/test_channel_wire.c
+	$(W53_TEST_DIR)/test_channel_wire \
+	    tests/fixtures/hwsim-world-phy.txt \
+	    tests/fixtures/hwsim-ua-phy.txt
+
+# Linux host: production regulatory bootstrap and START dispatch against a
+# mock iw in a temporary directory. No root, radio, netdev or manager.
+start-offline-test: tests/test_start_offline.c $(SRCS) $(HDRS)
+	mkdir -p $(W53_TEST_DIR)
+	$(HOSTCC) -O2 -Wall -Wno-unused-parameter -Wno-unused-function \
+	    -Wno-format-truncation $(HOST_MBEDTLS_CFLAGS) -Isrc \
+	    -o $(W53_TEST_DIR)/test_start_offline \
+	    tests/test_start_offline.c src/extmux.c $(HOST_MBEDTLS_LIBS)
+	$(W53_TEST_DIR)/test_start_offline
+
 clean:
 	rm -f capagent-mipsel
 	rm -rf $(W34_TEST_DIR) $(W53_TEST_DIR)
 
-.PHONY: all check clean w34-tests extmux-test iw-freq-test
+.PHONY: all check clean w34-tests extmux-test iw-freq-test \
+        channel-wire-test start-offline-test

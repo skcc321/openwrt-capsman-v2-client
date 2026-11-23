@@ -38,6 +38,69 @@ static void cap_reset_session(void)
     vapid_gc();                  /* keep MAC->vapid while the netdev lives */
 }
 
+/* The live TLS loop and offline rejection tests use this exact START path.
+ * A caller supplies the response writer; failure deliberately writes nothing
+ * because only the empty 0xE016 success wire format has been observed. */
+static int cap_handle_start(mbedtls_ssl_context *ssl, const uint8_t hdr[10],
+                            int port, const uint8_t *body, uint16_t len,
+                            const struct cfg *c,
+                            int (*provision)(int, const uint8_t *, uint16_t,
+                                             const struct cfg *,
+                                             const struct start_channel *),
+                            void (*reply)(mbedtls_ssl_context *, uint16_t,
+                                          const uint8_t [10],
+                                          const uint8_t *, uint16_t))
+{
+    struct phy_bands pb;
+    struct phy_caps pc;
+    struct start_channel ch;
+    int phy = port >> 8;
+    int valid = phy < c->nradios && phy < MAX_RADIOS;
+    /* Legacy/netifd-owned Wi-Fi and --no-vap-auto never start a BSS here;
+     * keep upstream's lenient channel bookkeeping and acknowledgement. */
+    int observer = wl_legacy() || !c->vap_auto;
+    if (valid) {
+        read_phy_bands(phy, &pb);
+        read_phy_caps(phy, &pc);
+        valid = start_channel_validate(body, len, &pb, &pc, &ch);
+    }
+    if (!valid && !observer) {
+        fprintf(stderr, "0x6016: reject invalid channel descriptor port=0x%04x\n",
+                port);
+        return 0;
+    }
+    /* Provisioning (MLME, the relay) reads the requested channel, so record
+     * it now but restore the previous one if the AP does not start: a
+     * refused repeat leaves the running BSS, and its channel, unchanged. */
+    uint32_t old_freq = 0;
+    uint8_t old_width = 0, old_band = 0;
+    int had_chan = vchan_get(port, &old_freq, &old_width, &old_band);
+    if (valid) {
+        vchan_set(port, ch.freq, ch.width, ch.band);
+    } else {
+        const uint8_t *cv = NULL; uint16_t cl = 0;
+        if (find_el(body, len, 0x0a, &cv, &cl) && cl)
+            vchan_from_tlv(port, cv, cl);
+    }
+    /* Upstream order: the relay registers frames before hostapd does, or
+     * nl80211 answers -EALREADY and the relay falls back to a monitor VIF. */
+    if (c->mgmt_relay || c->mgmt_source) {
+        const uint8_t *iv = NULL; uint16_t il = 0;
+        if (find_el(body, len, 0x48, &iv, &il) && il == 4)
+            mgmt_vap_add((int)rd32(iv));
+    }
+    if (!provision(port, body, len, c, valid ? &ch : NULL)) {
+        if (had_chan) vchan_set(port, old_freq, old_width, old_band);
+        else vchan_del(port);
+        fprintf(stderr, "0x6016: AP not enabled on port=0x%04x; "
+                "withholding success 0xE016 (failure wire format unknown)\n",
+                port);
+        return 0;
+    }
+    reply(ssl, TYPE_START_RESP, hdr, NULL, 0);
+    return 1;
+}
+
 static int run_once(struct cfg *c)
 {
     mbedtls_net_context fd;
@@ -99,6 +162,7 @@ static int run_once(struct cfg *c)
      * netdev/hostapd behaviour depends on it. */
     wl_classify(c);
     cap_reset_session();
+    vap_regulatory_bootstrap();   /* before NEWPHY samples the inventory */
     c->manager = choose_manager(c, mgr, sizeof(mgr));
     if (!c->manager || !*c->manager) {
         fprintf(stderr, "capagent: no manager available; retrying\n");
@@ -508,18 +572,10 @@ static int run_once(struct cfg *c)
             fflush(stdout);
         } else if (type == TYPE_START) {   /* ActAp start/config push (SSID/RSN/chan) */
             dump_raw("start", type, port, body, len);
-            const uint8_t *cv = NULL; uint16_t cl = 0;
-            if (find_el(body, len, 0x0a, &cv, &cl) && cl)
-                vchan_from_tlv(port, cv, cl);
-            printf("RX 0x6016 start port=0x%04x len=%u -> ack 0xE016\n", port, len);
+            printf("RX 0x6016 start port=0x%04x len=%u\n", port, len);
             fflush(stdout);
-            if (c->mgmt_relay || c->mgmt_source) {
-                const uint8_t *iv = NULL; uint16_t il = 0;
-                if (find_el(body, len, 0x48, &iv, &il) && il == 4)
-                    mgmt_vap_add((int)rd32(iv));
-            }
-            vap_provision(port, body, len, c);
-            send_hdr_msg(&ssl, TYPE_START_RESP, hdr + 2, NULL, 0);
+            cap_handle_start(&ssl, hdr + 2, port, body, len, c,
+                             vap_provision, send_hdr_msg);
         } else if (type == TYPE_ECHO) {
             const uint8_t *k = NULL, *iv = NULL;
             uint16_t kl = 0, il = 0;
@@ -611,7 +667,8 @@ static void usage(const char *p)
         "                               Auth/AssocReq source (auto: nl80211 when we\n"
         "                               own the AP, monitor when hostapd owns it)\n"
         "  --ext-auth-dir DIR           hostapd external-RSN dgram dir (P5)\n"
-        "  --country CC                 hostapd country_code (e.g. GR)\n"
+        "  --country CC                 CAP regulatory country (e.g. UA)\n"
+        "  --indoor                     permit indoor-only HE20 regulatory rules\n"
         "  --ext-ctrl-dir DIR           hostapd ctrl_interface dir (default: dir above)\n"
         "  --state-file FILE            key-free extmux restart journal\n"
         "  --vap-state FILE             netdev ownership journal\n"
@@ -667,7 +724,7 @@ int main(int argc, char **argv)
            OPT_DC_COOKIE, OPT_DC_ID, OPT_DC_PEER, OPT_APPLY, OPT_NOACK,
            OPT_EAPOL_LEG, OPT_LAB_AP, OPT_LAB_SSID, OPT_LAB_CHAN, OPT_INJECT,
            OPT_PHYS, OPT_DP_BRIDGE, OPT_VAP_MTU, OPT_BCAST, OPT_MGMT_RELAY,
-           OPT_MGMT_SOURCE, OPT_EXTAUTH, OPT_COUNTRY, OPT_VAPAUTO, OPT_NOVAPAUTO,
+           OPT_MGMT_SOURCE, OPT_EXTAUTH, OPT_COUNTRY, OPT_INDOOR, OPT_VAPAUTO, OPT_NOVAPAUTO,
            OPT_EXTCTRL, OPT_STATE, OPT_FOURWAY, OPT_M1RETRY,
            OPT_MLME, OPT_MLME_PORT,
            OPT_WLCONF, OPT_WLOWNER, OPT_NOTEARDOWN, OPT_POLICYTEST,
@@ -713,6 +770,7 @@ int main(int argc, char **argv)
         {"mgmt-source", required_argument, 0, OPT_MGMT_SOURCE},
         {"ext-auth-dir", required_argument, 0, OPT_EXTAUTH},
         {"country", required_argument, 0, OPT_COUNTRY},
+        {"indoor", no_argument, 0, OPT_INDOOR},
         {"ext-ctrl-dir", required_argument, 0, OPT_EXTCTRL},
         {"state-file", required_argument, 0, OPT_STATE},
         {"vap-state", required_argument, 0, OPT_VAPSTATE},
@@ -773,6 +831,7 @@ int main(int argc, char **argv)
         case OPT_DC_PEER: c.dc_peer_port = (uint16_t)atoi(optarg); break;
         case OPT_APPLY: g_apply = 1; break;
         case OPT_COUNTRY: g_vap_country = optarg; break;
+        case OPT_INDOOR: g_ax_indoor = 1; break;
         case OPT_VAPAUTO: c.vap_auto = 1; break;
         case OPT_NOVAPAUTO: c.vap_auto = 0; break;
         case OPT_NOACK: c.no_ack = 1; break;

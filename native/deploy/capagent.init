@@ -67,6 +67,7 @@ start_service() {
 	# CAPsMAN v2 does not deliver a regulatory country; hostapd needs one
 	# for 5 GHz AP channels (especially in a zero-local-config boot).
 	[ -n "${COUNTRY:-}" ] && set -- "$@" --country "${COUNTRY}"
+	[ "${INDOOR:-no}" = yes ] && set -- "$@" --indoor
 	# W36: in-CAP MLME (no hostapd) for one manager-provisioned VAP.
 	[ "${MLME:-no}" = yes ] && set -- "$@" --mlme
 	[ -n "${MLME_PORT:-}" ] && set -- "$@" --mlme-port "${MLME_PORT}"
