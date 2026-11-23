@@ -6,8 +6,16 @@
 #include <assert.h>
 #include <signal.h>
 static int test_req_set_reg(const char *cc);
+static int ax_scan_prepares;
+static int test_ax_scan_prepare(const char *ifname)
+{
+    (void)ifname;           /* "lo" stands in for the AP: never touch it */
+    ax_scan_prepares++;
+    return 0;
+}
 static char g_lock[128], g_dir[64];
 #define CAP_REQ_SET_REG test_req_set_reg
+#define VAP_AX_SCAN_PREPARE test_ax_scan_prepare
 #define VAP_START_LOCK g_lock
 #define VAP_RUN_DIR g_dir
 #define main capagent_unused_main
@@ -38,10 +46,14 @@ static void put_file(const char *name, const char *text)
 /* Remove everything the test may have created, also after a failed assert. */
 static void cleanup(void)
 {
-    static const char *const files[] = {"iw", "phy.txt", "reg.txt",
+    static const char *const files[] = {"iw", "phy.txt", "reg.txt", "events.log",
         "start.lock", "pwned", "hostapd", "hcount", "vap-lo.pid",
         "vaps.state", "vaps.state.tmp"};
     char path[128];
+    for (size_t i = 0; i < sizeof(g_vap_children) /
+                            sizeof(g_vap_children[0]); i++)
+        if (g_vap_children[i].pid)
+            vap_child_stop(&g_vap_children[i]);
     if (g_mock_ap > 0) kill(g_mock_ap, SIGKILL);
     for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
         dir_file(path, sizeof(path), files[i]);
@@ -245,6 +257,125 @@ static void assert_chan(uint32_t freq, uint8_t width, uint8_t band)
     assert(f == freq && w == width && b == band);
 }
 
+static void check_hostapd_log_states(void)
+{
+    char path[128];
+    dir_file(path, sizeof(path), "events.log");
+    put_file("events.log", "heagent0: AP-DISABLED\n"
+                           "heagent0: AP-ENABLED\n");
+    assert(vap_wait_ap_enabled(path, 100, 1) == 1);
+    /* The same log can change *after* a successful readiness check.
+     * A fresh read detects the later disable; this is not a watchdog
+     * or automatic recovery test. */
+    put_file("events.log", "heagent0: AP-ENABLED\n");
+    assert(vap_wait_ap_enabled(path, 100, 1) == 1);
+    FILE *later_disable = fopen(path, "a");
+    assert(later_disable);
+    assert(fputs("heagent0: AP-DISABLED\n", later_disable) >= 0);
+    assert(fclose(later_disable) == 0);
+    assert(vap_wait_ap_enabled(path, 100, 1) == 0);
+    put_file("events.log", "driver initialization failed\n"
+                           "heagent0: AP-ENABLED\n");
+    assert(vap_wait_ap_enabled(path, 100, 1) == 1);
+    put_file("events.log", "heagent0: AP-DISABLED\n"
+                           "heagent0: DFS-CAC-START\n");
+    assert(vap_wait_ap_enabled(path, 100, 0) == 1);
+    assert(vap_wait_ap_enabled(path, 100, 1) == 0);
+    put_file("events.log", "heagent0: AP-ENABLED\n"
+                           "heagent0: AP-DISABLED"); /* partial final line */
+    assert(vap_wait_ap_enabled(path, 100, 1) == 1);
+    FILE *f = fopen(path, "w");
+    assert(f);
+    for (int i = 0; i < 600; i++) fputs("unrelated verbose message\n", f);
+    fputs("heagent0: AP-DISABLED\nheagent0: AP-ENABLED\n", f);
+    fclose(f);
+    assert(vap_wait_ap_enabled(path, 100, 1) == 1);
+    put_file("events.log", "heagent0: AP-DISABLED\n");
+    pid_t writer = fork();
+    assert(writer >= 0);
+    if (!writer) {
+        usleep(150000);
+        FILE *later = fopen(path, "a");
+        if (!later) _exit(1);
+        fputs("heagent0: AP-ENABLED\n", later);
+        if (fclose(later)) _exit(1);
+        _exit(0);
+    }
+    assert(vap_wait_ap_enabled(path, 500, 1) == 1);
+    int status;
+    assert(waitpid(writer, &status, 0) == writer);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    put_file("events.log", "heagent0: AP-DISABLED\n");
+    assert(vap_wait_ap_enabled(path, 200, 1) == 0);
+    put_file("events.log", "waiting for a real event\n");
+    assert(vap_wait_ap_enabled(path, 100, 1) == -1);
+}
+
+static void assert_child_reaped(pid_t pid)
+{
+    int status;
+    assert(waitpid(pid, &status, WNOHANG) == -1 && errno == ECHILD);
+}
+
+static void check_hostapd_children(void)
+{
+    int status;
+    pid_t pid = fork();
+    assert(pid >= 0);
+    if (!pid) {
+        for (;;) pause();        /* successful foreground startup */
+    }
+    assert(vap_child_track("test-success", pid) == 0);
+    assert(vap_child_slot("test-success")->pid == pid);
+    assert(vap_child_stop(vap_child_slot("test-success")));
+    assert(!vap_child_slot("test-success"));
+    assert_child_reaped(pid);
+
+    pid = fork();
+    assert(pid >= 0);
+    if (!pid) _exit(3);          /* early hostapd failure */
+    assert(vap_child_track("test-early", pid) == 0);
+    int got = 0;
+    for (int i = 0; i < 100 && !got; i++) {
+        got = vap_child_poll(pid, &status);
+        usleep(1000);
+    }
+    assert(got == 1 && WIFEXITED(status) && WEXITSTATUS(status) == 3);
+    vap_child_forget(vap_child_slot("test-early"));
+    assert(!vap_child_slot("test-early"));
+    assert_child_reaped(pid);
+
+    int pipefd[2];
+    assert(pipe(pipefd) == 0);
+    pid = fork();
+    assert(pid >= 0);
+    if (!pid) {
+        close(pipefd[0]);
+        signal(SIGTERM, SIG_IGN);
+        assert(write(pipefd[1], "R", 1) == 1);
+        for (;;) pause();        /* timeout: ignores TERM, requires KILL */
+    }
+    close(pipefd[1]);
+    char ready;
+    assert(read(pipefd[0], &ready, 1) == 1 && ready == 'R');
+    close(pipefd[0]);
+    assert(vap_child_track("test-timeout", pid) == 0);
+    assert(vap_child_stop(vap_child_slot("test-timeout")));
+    assert(!vap_child_slot("test-timeout"));
+    assert_child_reaped(pid);
+
+    pid = fork();
+    assert(pid >= 0);
+    if (!pid) _exit(0);          /* exit after startup: watchdog sweep */
+    assert(vap_child_track("test-late", pid) == 0);
+    for (int i = 0; i < 100 && vap_child_slot("test-late"); i++) {
+        vap_children_sweep();
+        usleep(1000);
+    }
+    assert(!vap_child_slot("test-late"));
+    assert_child_reaped(pid);
+}
+
 int main(void)
 {
     char path[128], script[512];
@@ -261,6 +392,8 @@ int main(void)
     dir_file(path, sizeof(path), "iw");
     assert(chmod(path, 0700) == 0);
     assert(setenv("CAPAGENT_IW", path, 1) == 0);
+    check_hostapd_log_states();
+    check_hostapd_children();
     put_file("phy.txt", phy_world);
     put_file("reg.txt", reg_world);
 
@@ -456,12 +589,96 @@ int main(void)
     assert(!start_with(&c, running_bss_provision, body, n));
     assert_chan(5180, 3, 0x04);
 
+    /* Live RouterOS HE40 regression: wide AX runs hostapd in the foreground
+     * (no -B), and hostapd then writes no -P pid file. The production START
+     * tail (vap_hostapd_pid) must still see the running BSS and ACK. The
+     * mock never writes the pid file in foreground mode, like hostapd. */
+    kill(g_mock_ap, SIGKILL);                       /* retire the HE20 daemon */
+    g_mock_ap = 0;
+    dir_file(path, sizeof(path), "vap-lo.pid");     /* VAP_RUN_DIR, temp dir */
+    unlink(path);
+    e->pid = 0;
+    snprintf(script, sizeof(script),
+             "#!/bin/sh\nc='%s/hcount'\nn=$(cat \"$c\" 2>/dev/null || echo 0)\n"
+             "echo $((n + 1)) > \"$c\"\n"
+             "[ \"$1\" = -B ] && exit 9\n"          /* wide AX must not daemonize */
+             "echo AP-ENABLED\nexec tail -f /dev/null \"$3\" </dev/null\n",
+             g_dir);
+    put_file("hostapd", script);
+    dir_file(path, sizeof(path), "hostapd");
+    assert(chmod(path, 0700) == 0);
+    int prepares = ax_scan_prepares, before_resp = responses;
+    n = start_body(body, 5180, 2, 5190, 0x04);
+    assert(start_with(&c, journal_provision, body, n));
+    assert(responses == before_resp + 1);           /* 0xE016 sent */
+    assert(ax_scan_prepares == prepares + 1);
+    assert_chan(5180, 2, 0x04);
+    struct vap_child *fg = vap_child_slot("lo");
+    assert(fg && fg->pid == e->pid);                /* tracked foreground */
+    pid_t fg_pid = fg->pid;
+    assert(vap_pidfile_value("lo") == fg_pid);      /* written by the agent */
+    assert(vap_hostapd_pid("lo") == fg_pid && vap_hostapd_running("lo"));
+    dir_file(path, sizeof(path), "hcount");
+    hc = fopen(path, "r");
+    assert(hc && fscanf(hc, "%d", &launches) == 1);
+    fclose(hc);
+    assert(launches == 3);
+    /* An identical repeat and the reconcile tick reuse the live child. */
+    assert(start_with(&c, journal_provision, body, n));
+    assert(responses == before_resp + 2);
+    own_service(&c);
+    assert(e->pid == fg_pid && vap_child_slot("lo") == fg);
+    hc = fopen(path, "r");
+    assert(hc && fscanf(hc, "%d", &launches) == 1);
+    fclose(hc);
+    assert(launches == 3);                          /* no duplicate daemon */
+    /* Ownership teardown reaps the child (bounded) and drops its pid file. */
+    own_stop_pid(fg_pid);
+    assert(!vap_child_slot("lo"));
+    assert_child_reaped(fg_pid);
+    assert(vap_pidfile_value("lo") == 0 && !vap_hostapd_running("lo"));
+    e->pid = 0;
+
+    /* A foreground hostapd that dies after a successful START: the sweep
+     * reaps it and removes the agent-written pid file, so nothing mistakes
+     * a recycled pid for this BSS and the journal can restart it. */
+    unlink(VAP_CONF_DIR "/vap-lo.conf");
+    n = start_body(body, 5180, 2, 5190, 0x04);
+    body[4 + 2] ^= 1;                    /* SSID byte: a new profile body */
+    assert(start_with(&c, journal_provision, body, n));
+    fg = vap_child_slot("lo");
+    assert(fg && vap_pidfile_value("lo") == fg->pid);
+    fg_pid = fg->pid;
+    kill(fg_pid, SIGKILL);
+    for (int i = 0; i < 100 && vap_child_slot("lo"); i++) {
+        vap_children_sweep();
+        usleep(10000);
+    }
+    assert(!vap_child_slot("lo"));
+    assert_child_reaped(fg_pid);
+    assert(vap_pidfile_value("lo") == 0 && !vap_hostapd_running("lo"));
+    e->pid = 0;
+
+    /* A foreground child that exits right after logging AP-ENABLED is a
+     * failed start: no pid file, no ACK, no zombie. */
+    snprintf(script, sizeof(script),
+             "#!/bin/sh\necho AP-ENABLED\nsleep 1\nexit 0\n");
+    put_file("hostapd", script);
+    before_resp = responses;
+    body[4 + 2] ^= 2;
+    assert(!start_with(&c, journal_provision, body, n));
+    assert(responses == before_resp);
+    assert(!vap_child_slot("lo") && vap_pidfile_value("lo") == 0);
+    assert(waitpid(-1, NULL, WNOHANG) <= 0);        /* nothing left to reap */
+
     dir_file(path, sizeof(path), "pwned");
     assert(access(path, F_OK) != 0 && access("pwned", F_OK) != 0);
     cleanup();
     assert(access(g_dir, F_OK) != 0 && access(conf, F_OK) != 0);
     puts("offline START: world->UA bootstrap, multi-radio rules, ownership "
          "modes, conflicting repeats and failed START keep the running "
-         "channel, automatic retry records it, no false 0xE016 PASS");
+         "channel, automatic retry records it, no false 0xE016; ordered "
+         "hostapd logs, bounded child reaping and foreground HE40 0xE016 "
+         "PASS");
     return 0;
 }

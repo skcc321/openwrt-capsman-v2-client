@@ -419,29 +419,189 @@ static void vap_bridge_if_present(const char *ifname, unsigned vlan,
  * on timeout) keep one bad BSS from poisoning the whole radio. */
 static int vap_wait_ap_enabled(const char *logf, int ms, int ax)
 {
+    int failed = 0;
     for (int i = 0; i < ms / 100; i++) {
         FILE *f = fopen(logf, "r");
         if (f) {
-            char b[4096];
-            if (fseek(f, 0, SEEK_END) == 0) {
-                long end = ftell(f);
-                if (end > (long)sizeof(b) - 1)
-                    fseek(f, end - ((long)sizeof(b) - 1), SEEK_SET);
-                else rewind(f);
+            char line[4096];
+            int state = -1;
+            while (fgets(line, sizeof(line), f)) {
+                /* Only complete lines count. Discard an overlong or
+                 * currently unfinished line rather than accepting a
+                 * partial AP state at the end of a live log. */
+                if (!strchr(line, '\n')) {
+                    if (!feof(f)) {
+                        int c;
+                        while ((c = fgetc(f)) != '\n' && c != EOF) {}
+                    }
+                    continue;
+                }
+                if (strstr(line, "AP-DISABLED") ||
+                    strstr(line, "driver initialization failed") ||
+                    strstr(line, "Could not set interface"))
+                    state = 0;
+                else if (strstr(line, "AP-ENABLED") ||
+                         (!ax && (strstr(line, "DFS-CAC-START") ||
+                                  strstr(line, "DFS-CAC-COMPLETED"))))
+                    state = 1;
             }
-            size_t n = fread(b, 1, sizeof(b) - 1, f);
             fclose(f);
-            b[n] = 0;
-            if (strstr(b, "AP-DISABLED") ||
-                strstr(b, "driver initialization failed") ||
-                strstr(b, "Could not set interface")) return 0;
-            if (strstr(b, "AP-ENABLED") ||
-                (!ax && (strstr(b, "DFS-CAC-START") ||
-                         strstr(b, "DFS-CAC-COMPLETED")))) return 1;
+            if (state == 1) return 1;
+            /* A transient AP-DISABLED may be followed by AP-ENABLED.
+             * Let the bounded readiness window observe recovery rather
+             * than killing a child on the first disabled poll. */
+            if (state == 0) failed = 1;
         }
         usleep(100000);
     }
+    return failed ? 0 : -1;
+}
+
+/* A foreground AX/diagnostic hostapd is our direct child. Its pid file
+ * may be absent and kill(pid, 0) is true even for a zombie; track only
+ * children we forked and never wait on an adopted or netifd process. */
+static struct vap_child {
+    pid_t pid;
+    char ifname[32];
+} g_vap_children[MAX_RADIOS * 16 + 2];
+
+static struct vap_child *vap_child_slot(const char *ifname)
+{
+    for (size_t i = 0; i < sizeof(g_vap_children) /
+                            sizeof(g_vap_children[0]); i++)
+        if (g_vap_children[i].pid && !strcmp(g_vap_children[i].ifname, ifname))
+            return &g_vap_children[i];
+    return NULL;
+}
+
+/* 1=reaped, 0=still running, -1=not our child (ECHILD). */
+static int vap_child_poll(pid_t pid, int *status)
+{
+    pid_t r;
+    do r = waitpid(pid, status, WNOHANG);
+    while (r < 0 && errno == EINTR);
+    return r == pid ? 1 : r == 0 ? 0 : -1;
+}
+
+/* Read the pid recorded in our per-ifname pid file, or 0. */
+static pid_t vap_pidfile_value(const char *ifname)
+{
+    char pidf[128];
+    long pid = 0;
+    snprintf(pidf, sizeof(pidf), "%s/vap-%s.pid", VAP_RUN_DIR, ifname);
+    FILE *f = fopen(pidf, "r");
+    if (!f) return 0;
+    if (fscanf(f, "%ld", &pid) != 1) pid = 0;
+    fclose(f);
+    return pid > 0 ? (pid_t)pid : 0;
+}
+
+/* Called once a direct child has been reaped. A foreground hostapd's pid
+ * file is written by us (see vap_hostapd_start_one); drop it so no other
+ * path mistakes a recycled pid for this BSS. A -B intermediate child never
+ * matches the daemon's pid file, which is left alone. */
+static void vap_child_forget(struct vap_child *child)
+{
+    if (!child) return;
+    if (child->pid && child->ifname[0] &&
+        vap_pidfile_value(child->ifname) == child->pid) {
+        char pidf[128];
+        snprintf(pidf, sizeof(pidf), "%s/vap-%s.pid", VAP_RUN_DIR,
+                 child->ifname);
+        unlink(pidf);
+    }
+    memset(child, 0, sizeof(*child));
+}
+
+/* hostapd writes -P only when it daemonizes (-B). For a foreground child
+ * the agent records the same identity, atomically, so the pid file plus
+ * /proc cmdline check stays the single W52 "is it running" rule. */
+static int vap_write_pidfile(const char *pidf, pid_t pid)
+{
+    char tmp[160];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", pidf);
+    int fd = open(tmp, O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) return -1;
+    char b[24];
+    int n = snprintf(b, sizeof(b), "%ld\n", (long)pid);
+    int ok = write(fd, b, (size_t)n) == n;
+    ok = close(fd) == 0 && ok;
+    if (!ok || rename(tmp, pidf) != 0) {
+        unlink(tmp);
+        return -1;
+    }
+    return 0;
+}
+
+static int vap_child_track(const char *ifname, pid_t pid)
+{
+    for (size_t i = 0; i < sizeof(g_vap_children) /
+                            sizeof(g_vap_children[0]); i++)
+        if (!g_vap_children[i].pid) {
+            g_vap_children[i].pid = pid;
+            snprintf(g_vap_children[i].ifname,
+                     sizeof(g_vap_children[i].ifname), "%s", ifname);
+            return 0;
+        }
     return -1;
+}
+
+static int vap_child_room(void)
+{
+    for (size_t i = 0; i < sizeof(g_vap_children) /
+                            sizeof(g_vap_children[0]); i++)
+        if (!g_vap_children[i].pid) return 1;
+    return 0;
+}
+
+/* Reap a direct child with bounded TERM/KILL waits. An uninterruptible
+ * child stays tracked for the next watchdog sweep, not silently forgotten. */
+static int vap_child_stop(struct vap_child *child)
+{
+    if (!child || !child->pid) return 1;
+    pid_t pid = child->pid;
+    int status;
+    if (vap_child_poll(pid, &status) != 0) {
+        vap_child_forget(child);
+        return 1;
+    }
+    kill(pid, SIGTERM);
+    for (int i = 0; i < 20; i++) {
+        if (vap_child_poll(pid, &status) != 0) {
+            vap_child_forget(child);
+            return 1;
+        }
+        usleep(100000);
+    }
+    kill(pid, SIGKILL);
+    for (int i = 0; i < 10; i++) {
+        if (vap_child_poll(pid, &status) != 0) {
+            vap_child_forget(child);
+            return 1;
+        }
+        usleep(100000);
+    }
+    return 0;
+}
+
+static struct vap_child *vap_child_by_pid(pid_t pid)
+{
+    for (size_t i = 0; pid > 0 && i < sizeof(g_vap_children) /
+                                       sizeof(g_vap_children[0]); i++)
+        if (g_vap_children[i].pid == pid)
+            return &g_vap_children[i];
+    return NULL;
+}
+
+static void vap_children_sweep(void)
+{
+    for (size_t i = 0; i < sizeof(g_vap_children) /
+                            sizeof(g_vap_children[0]); i++)
+        if (g_vap_children[i].pid) {
+            int status;
+            if (vap_child_poll(g_vap_children[i].pid, &status) != 0)
+                vap_child_forget(&g_vap_children[i]);
+        }
 }
 
 /* Wide AX must allow hostapd's HT coexistence scan; only lower our own
@@ -462,6 +622,10 @@ static int vap_down_for_ax_scan(const char *ifname)
     close(fd);
     return rc;
 }
+
+#ifndef VAP_AX_SCAN_PREPARE       /* tests must never down a real netdev */
+#define VAP_AX_SCAN_PREPARE vap_down_for_ax_scan
+#endif
 
 /* Build and start a hostapd instance for one provisioned VAP. */
 static int vap_hostapd_start_one(int port, const char *ifname, int phy, int vapid,
@@ -598,7 +762,7 @@ static int vap_hostapd_start_one(int port, const char *ifname, int phy, int vapi
     if (getenv("CAPAGENT_HOSTAPD_DEBUG"))
         fprintf(f, "logger_syslog=-1\nlogger_stdout_level=3\n");
     fclose(f);
-    if (ax && ch.width > 1 && vap_down_for_ax_scan(ifname) != 0) {
+    if (ax && ch.width > 1 && VAP_AX_SCAN_PREPARE(ifname) != 0) {
         fprintf(stderr, "vap: cannot prepare AX scan for %s: %s\n",
                 ifname, strerror(errno));
         return -1;
@@ -609,14 +773,21 @@ static int vap_hostapd_start_one(int port, const char *ifname, int phy, int vapi
         snprintf(ctrl, sizeof(ctrl), "/var/run/hostapd/%s", ifname);
         unlink(ctrl);
     }
+    vap_children_sweep();
+    if (vap_child_slot(ifname) || !vap_child_room()) {
+        fprintf(stderr, "vap: no free hostapd child slot for %s\n", ifname);
+        return -1;
+    }
+    int debug = getenv("CAPAGENT_HOSTAPD_DEBUG") != NULL;
+    int foreground = debug || (ax && ch.width > 1);
     pid_t pid = fork();
     if (pid == 0) {
         int fd = open(logf, O_CREAT | O_WRONLY | O_TRUNC, 0600);
         if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); close(fd); }
-        if (getenv("CAPAGENT_HOSTAPD_DEBUG"))
+        if (debug)
             execl(hostapd_exe_path(), "hostapd", "-dd",
                   "-P", pidf, path, (char *)NULL);
-        else if (ax && ch.width > 1)
+        else if (foreground)
             execl(hostapd_exe_path(), "hostapd", "-P", pidf, path,
                   (char *)NULL);
         else
@@ -628,21 +799,30 @@ static int vap_hostapd_start_one(int port, const char *ifname, int phy, int vapi
         fprintf(stderr, "vap: fork hostapd %s: %s\n", ifname, strerror(errno));
         return -1;
     }
+    if (vap_child_track(ifname, pid) != 0) {
+        /* Unreachable in the single-threaded loop after the capacity
+         * check, but keep even this exceptional wait bounded. */
+        struct vap_child temporary = {.pid = pid};
+        vap_child_stop(&temporary);
+        return -1;
+    }
     {
         /* hostapd -B daemonizes: the direct child exits once setup is done,
            so reap it (otherwise every failed BSS leaves a zombie) and use
            its status to tell "started" from "config/driver refused".  Never
            block the TLS loop on a slow setup (DFS/ACS): poll for 3 s. */
-        int st = 0, reaped = 0;
+        int st = 0, reaped = 0, child_error = 0;
         for (int i = 0; i < 30; i++) {
-            pid_t r = waitpid(pid, &st, WNOHANG);
-            if (r == pid) { reaped = 1; break; }
-            if (r < 0) break;
+            int r = vap_child_poll(pid, &st);
+            if (r != 0) { reaped = 1; child_error = r < 0; break; }
             usleep(100000);
         }
-        if (reaped && (!WIFEXITED(st) || WEXITSTATUS(st) != 0)) {
+        if (reaped) vap_child_forget(vap_child_slot(ifname));
+        if (reaped && (child_error || !WIFEXITED(st) ||
+                       WEXITSTATUS(st) != 0)) {
             printf("vap: hostapd %s failed to start (status=%d), see %s\n",
-                   ifname, WIFEXITED(st) ? WEXITSTATUS(st) : -1, logf);
+                   ifname, !child_error && WIFEXITED(st) ?
+                   WEXITSTATUS(st) : -1, logf);
             fflush(stdout);
             return -1;
         }
@@ -650,12 +830,29 @@ static int vap_hostapd_start_one(int port, const char *ifname, int phy, int vapi
     /* Bounded, log-based readiness check: the pid alone proves nothing,
      * and hostapd -B may write it only while we are waiting. */
     int ready = vap_wait_ap_enabled(logf, 12000, ax);
+    if (ready == 1 && foreground) {
+        /* The enabled BSS must still be our live, tracked child; only then
+         * record it. Failure here is a failed start, not a guess. */
+        struct vap_child *child = vap_child_slot(ifname);
+        int st;
+        int r = child && child->pid == pid ? vap_child_poll(pid, &st) : -1;
+        if (r != 0) {
+            if (r > 0) vap_child_forget(child);
+            printf("vap: foreground hostapd %s exited after AP-ENABLED\n",
+                   ifname);
+            ready = 0;
+        } else if (vap_write_pidfile(pidf, pid) != 0) {
+            printf("vap: cannot record hostapd %s pid in %s: %s\n", ifname,
+                   pidf, strerror(errno));
+            ready = 0;
+        }
+    }
     int hpid = vap_hostapd_pid(ifname);
-    if (hpid <= 0 && ax && ch.width > 1) hpid = vap_find_hostapd(ifname);
     if (ready == 0) {
         printf("vap: hostapd %s did not enable, see %s\n", ifname, logf);
         fflush(stdout);
         if (hpid > 0) kill((pid_t)hpid, SIGTERM);
+        vap_child_stop(vap_child_slot(ifname));
         /* Never unlink the pid file here: it may belong to an instance that
          * is already up (a repeated 0x6016) and unlinking it makes the
          * watchdog spawn a duplicate.  A stale pid is harmless. */
@@ -667,9 +864,20 @@ static int vap_hostapd_start_one(int port, const char *ifname, int phy, int vapi
                " see %s\n", ifname, hpid, logf);
         fflush(stdout);
         if (hpid > 0) kill((pid_t)hpid, SIGKILL);
+        vap_child_stop(vap_child_slot(ifname));
         return -1;
     }
     usleep(1000 * 1000);    /* let the chanctx settle before the next VAP */
+    if (ax) {
+        vap_children_sweep();
+        if (vap_wait_ap_enabled(logf, 100, ax) != 1 ||
+            vap_hostapd_pid(ifname) <= 0) {
+            fprintf(stderr, "vap: %s lost AP-ENABLED after settling\n", ifname);
+            if (hpid > 0) kill((pid_t)hpid, SIGTERM);
+            vap_child_stop(vap_child_slot(ifname));
+            return -1;
+        }
+    }
     printf("vap: hostapd %s ssid=%s freq=%u akm=%s%s%s mfp=%d vlan=%u pid=%d\n",
            ifname, (const char *)ssid, freq,
            ri.akm_psk ? "psk" : "", ri.akm_psk256 ? ",psk256" : "",
@@ -677,7 +885,10 @@ static int vap_hostapd_start_one(int port, const char *ifname, int phy, int vapi
            vp ? vp->vlan : 0, hpid);
     fflush(stdout);
     if (vp) vp->hostapd_started_at = time(NULL);
-    if (hpid <= 0) return -1;
+    if (hpid <= 0) {
+        vap_child_stop(vap_child_slot(ifname));
+        return -1;
+    }
     /* The BSS is on air with this validated descriptor, whether a 0x6016 or
      * an automatic retry from the journal started it: record that channel. */
     vchan_set(port, ch.freq, ch.width, ch.band);
@@ -843,8 +1054,13 @@ static void vap_stop_hostapd(struct vap *v)
     if (!v || !v->ifname[0]) return;
     char conf[128], pidf[128];
     vap_paths(v->ifname, conf, sizeof(conf), pidf, sizeof(pidf));
+    struct vap_child *child = vap_child_slot(v->ifname);
+    pid_t child_pid = child ? child->pid : 0;
+    if (child) vap_child_stop(child);
     pid_t pid = vap_read_pidfile(v->ifname);
+    if (pid == child_pid) pid = 0; /* already reaped our direct child */
     if (pid <= 0) pid = (pid_t)v->hostapd_pid;
+    if (pid == child_pid) pid = 0;
     if (!vap_pid_alive(pid)) pid = vap_find_hostapd(v->ifname);
     if (vap_pid_alive(pid)) {
         printf("vap: stopping hostapd %s pid=%d\n", v->ifname, (int)pid);
@@ -1250,6 +1466,12 @@ static int vap_ifname_is_ours(const char *name)
 
 static void vap_kill_orphan(pid_t pid, const char *why)
 {
+    for (size_t i = 0; i < sizeof(g_vap_children) /
+                            sizeof(g_vap_children[0]); i++)
+        if (g_vap_children[i].pid == pid) {
+            vap_child_stop(&g_vap_children[i]);
+            return;
+        }
     if (!vap_pid_alive(pid)) return;
     printf("watchdog: killing %s pid=%d\n", why, (int)pid);
     fflush(stdout);
@@ -1265,6 +1487,7 @@ static void vap_kill_orphan(pid_t pid, const char *why)
    ext-auth socket behind, and a dead BSS is marked down for reconcile. */
 static void vap_watchdog(const struct cfg *c)
 {
+    vap_children_sweep();
     time_t now = time(NULL);
     int legacy = wl_legacy();
 

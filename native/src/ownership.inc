@@ -419,6 +419,13 @@ static int own_hostapd_pid(const char *ifname)
 
 static void own_stop_pid(int pid)
 {
+    /* A foreground hostapd is our child: a zombie still passes kill(pid,0),
+     * so reap it with the bounded child stop instead of polling. */
+    struct vap_child *child = vap_child_by_pid((pid_t)pid);
+    if (child) {
+        vap_child_stop(child);
+        return;
+    }
     if (!own_pid_alive(pid))
         return;
     kill((pid_t)pid, SIGTERM);
