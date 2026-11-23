@@ -122,9 +122,18 @@ start-offline-test: tests/test_start_offline.c $(SRCS) $(HDRS)
 	    tests/test_start_offline.c src/extmux.c $(HOST_MBEDTLS_LIBS)
 	$(W53_TEST_DIR)/test_start_offline
 
+# Build the lab-only production START injector. Running it requires a
+# separately preflighted, isolated hwsim VM; never run it from `make check`.
+offline-ax-start: tests/offline_ax_start.c $(SRCS) $(HDRS)
+	mkdir -p $(W53_TEST_DIR)
+	$(HOSTCC) -O2 -Wall -Wno-unused-parameter -Wno-unused-function \
+	    -Wno-format-truncation $(HOST_MBEDTLS_CFLAGS) -Isrc \
+	    -o $(W53_TEST_DIR)/offline_ax_start \
+	    tests/offline_ax_start.c src/extmux.c $(HOST_MBEDTLS_LIBS)
+
 clean:
 	rm -f capagent-mipsel
 	rm -rf $(W34_TEST_DIR) $(W53_TEST_DIR)
 
 .PHONY: all check clean w34-tests extmux-test iw-freq-test \
-        channel-wire-test start-offline-test
+        channel-wire-test start-offline-test offline-ax-start

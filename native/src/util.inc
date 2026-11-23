@@ -389,6 +389,8 @@ struct phy_bands {
     int nband;
     int he5;
     uint8_t he5freq[PHY_MAX_FREQ];
+    uint8_t he5wide[PHY_MAX_FREQ]; /* 1=HT40+, 2=HT40-, 4=HE80 */
+    uint8_t he5wideband[PHY_MAX_FREQ]; /* common band for constituents */
     uint8_t dfs[PHY_MAX_FREQ];
 };
 

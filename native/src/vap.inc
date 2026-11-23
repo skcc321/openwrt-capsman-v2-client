@@ -39,6 +39,7 @@
 static const char *g_vap_country;
 
 static int vap_hostapd_pid(const char *ifname);
+static pid_t vap_find_hostapd(const char *ifname);
 
 /* Parse the RSN IE (element 48) out of the manager's IE blob. */
 struct rsn_info {
@@ -224,7 +225,7 @@ static int vap_ht40_sign5(uint32_t freq)
 /* hostapd channel lines for one VAP.  wcode is the manager's 0x0c width code.
  * A VHT80 BSS needs both vht_oper_chwidth and the centre-frequency index,
  * otherwise hostapd's DFS start-channel computation fails even on ch36. */
-static void vap_write_channel(FILE *f, uint32_t freq, int wcode)
+static void vap_write_channel(FILE *f, uint32_t freq, int wcode, int ax)
 {
     if (!vap_is_5g(freq)) {
         int chan = freq == 2484 ? 14 : (int)((freq - 2407) / 5);
@@ -266,7 +267,8 @@ static void vap_write_channel(FILE *f, uint32_t freq, int wcode)
      * and a DFS channel must keep its CAC/radar scan, so noscan is never
      * written for a DFS primary.  The stock OpenWrt hostapd already ships
      * this option (300-noscan.patch) and netifd sets ht_coex=0. */
-    if (width >= 80 && !vap_is_dfs_chan(chan)) fprintf(f, "noscan=1\n");
+    if (width >= 80 && !vap_is_dfs_chan(chan) && !ax)
+        fprintf(f, "noscan=1\n");
     /* Regulatory domain is set once by vap_set_regdomain(); per-BSS
      * country_code stalls in COUNTRY_UPDATE.  11d/11h are only needed for
      * DFS channels. */
@@ -415,25 +417,50 @@ static void vap_bridge_if_present(const char *ifname, unsigned vlan,
  * still be in HT_SCAN/DFS; the next start on the same phy then gets EBUSY
  * or blocks in D state.  The lock plus the bounded wait (and the hard kill
  * on timeout) keep one bad BSS from poisoning the whole radio. */
-static int vap_wait_ap_enabled(const char *logf, int ms)
+static int vap_wait_ap_enabled(const char *logf, int ms, int ax)
 {
     for (int i = 0; i < ms / 100; i++) {
         FILE *f = fopen(logf, "r");
         if (f) {
             char b[4096];
+            if (fseek(f, 0, SEEK_END) == 0) {
+                long end = ftell(f);
+                if (end > (long)sizeof(b) - 1)
+                    fseek(f, end - ((long)sizeof(b) - 1), SEEK_SET);
+                else rewind(f);
+            }
             size_t n = fread(b, 1, sizeof(b) - 1, f);
             fclose(f);
             b[n] = 0;
-            if (strstr(b, "AP-ENABLED") ||
-                strstr(b, "DFS-CAC-START") ||
-                strstr(b, "DFS-CAC-COMPLETED")) return 1;
             if (strstr(b, "AP-DISABLED") ||
                 strstr(b, "driver initialization failed") ||
                 strstr(b, "Could not set interface")) return 0;
+            if (strstr(b, "AP-ENABLED") ||
+                (!ax && (strstr(b, "DFS-CAC-START") ||
+                         strstr(b, "DFS-CAC-COMPLETED")))) return 1;
         }
         usleep(100000);
     }
     return -1;
+}
+
+/* Wide AX must allow hostapd's HT coexistence scan; only lower our own
+ * freshly created CAP VIF, never an adopted/netifd-owned interface. */
+static int vap_down_for_ax_scan(const char *ifname)
+{
+    struct ifreq ifr;
+    if (!ifname || strlen(ifname) >= IFNAMSIZ) return -1;
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return -1;
+    memset(&ifr, 0, sizeof(ifr));
+    snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s", ifname);
+    int rc = ioctl(fd, SIOCGIFFLAGS, &ifr);
+    if (rc == 0) {
+        ifr.ifr_flags &= (short)~IFF_UP;
+        rc = ioctl(fd, SIOCSIFFLAGS, &ifr);
+    }
+    close(fd);
+    return rc;
 }
 
 /* Build and start a hostapd instance for one provisioned VAP. */
@@ -485,8 +512,14 @@ static int vap_hostapd_start_one(int port, const char *ifname, int phy, int vapi
                 vp->bssid[4], vp->bssid[5]);
     }
     if (bridge[0]) fprintf(f, "bridge=%s\n", bridge);
-    vap_write_channel(f, freq, ch.width);
-    if (ax) fprintf(f, "ieee80211ax=1\nhe_oper_chwidth=0\n");
+    vap_write_channel(f, freq, ch.width, ax);
+    if (ax) {
+        fprintf(f, "ieee80211ax=1\nhe_oper_chwidth=%d\n",
+                ch.width == 3 ? 1 : 0);
+        if (ch.width == 3)
+            fprintf(f, "he_oper_centr_freq_seg0_idx=%u\n",
+                    ch.centre / 5 - 1000);
+    }
 
     int have_psk = ri.valid && (ri.akm_psk || ri.akm_psk256);
     int have_sae = ri.valid && (ri.akm_sae || ri.akm_owe) &&
@@ -565,6 +598,11 @@ static int vap_hostapd_start_one(int port, const char *ifname, int phy, int vapi
     if (getenv("CAPAGENT_HOSTAPD_DEBUG"))
         fprintf(f, "logger_syslog=-1\nlogger_stdout_level=3\n");
     fclose(f);
+    if (ax && ch.width > 1 && vap_down_for_ax_scan(ifname) != 0) {
+        fprintf(stderr, "vap: cannot prepare AX scan for %s: %s\n",
+                ifname, strerror(errno));
+        return -1;
+    }
 
     {   /* a killed hostapd leaves its per-BSS ctrl socket behind */
         char ctrl[128];
@@ -578,6 +616,9 @@ static int vap_hostapd_start_one(int port, const char *ifname, int phy, int vapi
         if (getenv("CAPAGENT_HOSTAPD_DEBUG"))
             execl(hostapd_exe_path(), "hostapd", "-dd",
                   "-P", pidf, path, (char *)NULL);
+        else if (ax && ch.width > 1)
+            execl(hostapd_exe_path(), "hostapd", "-P", pidf, path,
+                  (char *)NULL);
         else
             execl(hostapd_exe_path(), "hostapd", "-B", "-P", pidf, path,
                   (char *)NULL);
@@ -608,8 +649,9 @@ static int vap_hostapd_start_one(int port, const char *ifname, int phy, int vapi
     }
     /* Bounded, log-based readiness check: the pid alone proves nothing,
      * and hostapd -B may write it only while we are waiting. */
-    int ready = vap_wait_ap_enabled(logf, 12000);
+    int ready = vap_wait_ap_enabled(logf, 12000, ax);
     int hpid = vap_hostapd_pid(ifname);
+    if (hpid <= 0 && ax && ch.width > 1) hpid = vap_find_hostapd(ifname);
     if (ready == 0) {
         printf("vap: hostapd %s did not enable, see %s\n", ifname, logf);
         fflush(stdout);

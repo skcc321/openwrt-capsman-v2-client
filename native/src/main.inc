@@ -668,7 +668,7 @@ static void usage(const char *p)
         "                               own the AP, monitor when hostapd owns it)\n"
         "  --ext-auth-dir DIR           hostapd external-RSN dgram dir (P5)\n"
         "  --country CC                 CAP regulatory country (e.g. UA)\n"
-        "  --indoor                     permit indoor-only HE20 regulatory rules\n"
+        "  --indoor                     permit indoor-only HE regulatory rules\n"
         "  --ext-ctrl-dir DIR           hostapd ctrl_interface dir (default: dir above)\n"
         "  --state-file FILE            key-free extmux restart journal\n"
         "  --vap-state FILE             netdev ownership journal\n"

@@ -85,6 +85,18 @@ static const char phy_ua[] =
     "\t\t\t* 5180.0 MHz [36] (20.0 dBm)\n"
     "\t\t\t* 5200.0 MHz [40] (20.0 dBm)\n"
     "\t\t\t* 5260.0 MHz [52] (20.0 dBm) (radar detection)\n";
+static const char phy_ua_wide[] =
+    "Wiphy phy0\n\tAvailable Antennas: TX 0x3 RX 0x3\n"
+    "\tBand 1:\n\t\tHE Iftypes: AP\n"
+    "\t\t\t* 2412.0 MHz [1] (20.0 dBm)\n"
+    "\tBand 2:\n\t\tCapabilities: 0x1234\n\t\t\tHT20/HT40\n"
+    "\t\tVHT Capabilities (0x1234):\n"
+    "\t\tHE Iftypes: AP\n\t\t\tHE PHY Capabilities: (0x1cbfce)\n"
+    "\t\t\t* 5180.0 MHz [36] (20.0 dBm)\n"
+    "\t\t\t* 5200.0 MHz [40] (20.0 dBm)\n"
+    "\t\t\t* 5220.0 MHz [44] (20.0 dBm)\n"
+    "\t\t\t* 5240.0 MHz [48] (20.0 dBm)\n"
+    "\t\t\t* 5260.0 MHz [52] (20.0 dBm) (radar detection)\n";
 static const char reg_world[] =
     "global\ncountry 00: DFS-UNSET\n"
     "\t(2402 - 2472 @ 40), (N/A, 20), (N/A)\n"
@@ -313,7 +325,7 @@ int main(void)
     assert(!start(&c, body, n) && responses == 2);
     assert_chan(5180, 1, 0x04);
 
-    /* Rejected before any provisioning: AX40/80, DFS AX, bad TLV, duplicate. */
+    /* HE20-only PHY: wide AX refused; DFS AX and bad TLVs also refused. */
     int before = provisions;
     provision_result = 1;
     n = start_body(body, 5180, 2, 5190, 0x04);
@@ -413,6 +425,36 @@ int main(void)
     assert(hc && fscanf(hc, "%d", &launches) == 1);
     fclose(hc);
     assert(launches == 2);              /* no second daemon on the repeat */
+
+    /* Switch only the mock inventory to a HE40/HE80-capable PHY. The
+     * production NEWPHY, CREATEVAP and START readers must agree. */
+    put_file("phy.txt", phy_ua_wide);
+    assert(newphy_ax_mask() == 7);
+    assert(has_desc(5180, 0x04, 1) &&
+           has_desc(5180, 0x04, 2) && has_desc(5180, 0x04, 3));
+    assert(!has_desc(5260, 0x04, 2)); /* no DFS/CAC bypass */
+    before = provisions;
+    n = start_body(body, 5180, 2, 5210, 0x04);
+    assert(!start(&c, body, n));      /* wrong HE40 center */
+    n = start_body(body, 5180, 3, 5190, 0x04);
+    assert(!start(&c, body, n));      /* wrong HE80 center */
+    n = start_body(body, 5180, 4, 5210, 0x04);
+    assert(!start(&c, body, n));      /* HE160 unsupported */
+    assert(provisions == before && responses == 7);
+    n = start_body(body, 5180, 2, 5190, 0x04);
+    provision_result = 0;
+    assert(!start(&c, body, n) && responses == 7);
+    assert_chan(5200, 1, 0x04);     /* failed width change cannot overwrite */
+    provision_result = 1;
+    assert(start(&c, body, n) && responses == 8);
+    assert_chan(5180, 2, 0x04);
+    n = start_body(body, 5180, 3, 5210, 0x04);
+    assert(start(&c, body, n) && responses == 9);
+    assert_chan(5180, 3, 0x04);
+    run_freq = 5180; run_width = 80; run_ax = 1;
+    n = start_body(body, 5180, 2, 5190, 0x04);
+    assert(!start_with(&c, running_bss_provision, body, n));
+    assert_chan(5180, 3, 0x04);
 
     dir_file(path, sizeof(path), "pwned");
     assert(access(path, F_OK) != 0 && access("pwned", F_OK) != 0);

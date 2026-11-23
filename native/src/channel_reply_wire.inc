@@ -14,7 +14,7 @@ static uint32_t ccfi80(uint32_t f)
    The manager keeps one row per (frequency, band, width) and echoes the
    chosen descriptor verbatim in 0x6016.  A profile channel is available
    only when a descriptor with the profile's band and frequency exists at
-   the requested width. AX is limited to eligible HE20; legacy widths
+   the requested width. AX wide modes require eligible 20 MHz constituents
    require every constituent AP-eligible channel.
    Widths: 1 = 20, 2 = 40, 3 = 80 MHz; 0x0d is the centre
    frequency and is required for widths > 20 MHz. */
@@ -91,15 +91,39 @@ static int legacy_channel_ok(const struct phy_bands *pb, uint32_t f,
     return 0;
 }
 
-/* Shared advertisement/START gate: PR #2 supports HE20 only. */
+static uint8_t ax_freq_bands(const struct phy_bands *pb, uint32_t f, uint8_t bit)
+{
+    for (int i = 0; i < pb->nfreq; i++)
+        if (pb->freq[i] == f && pb->he5freq[i] &&
+            (!bit || (pb->he5wide[i] & bit)))
+            return bit ? pb->he5wideband[i] : 0xff;
+    return 0;
+}
+
+/* Shared advertisement/START gate. DFS remains denied until a validated
+ * AX CAC lifecycle exists; all constituents must be AP-eligible. */
 static int ax_channel_ok(const struct phy_bands *pb, const struct phy_caps *pc,
                          uint32_t f, uint8_t w, uint32_t centre)
 {
     if (!pb->he5 || !pc->has_he || !supported_primary(f) ||
-        f < 5180 || f >= 5925 ||
-        w != 1 || (centre != 0 && centre != f)) return 0;
-    for (int i = 0; i < pb->nfreq; i++)
-        if (pb->freq[i] == f && pb->he5freq[i]) return 1;
+        f < 5180 || f >= 5925 || !ax_freq_bands(pb, f, 0)) return 0;
+    if (w == 1) return centre == 0 || centre == f;
+    uint32_t c40, c80;
+    if (!he_wide_centers(f, &c40, &c80)) return 0;
+    if (w == 2 && centre == c40) {
+        uint8_t bit = c40 > f ? 1 : 2;
+        return (ax_freq_bands(pb, f, bit) &
+                ax_freq_bands(pb, 2 * c40 - f, c40 > f ? 2 : 1)) != 0;
+    }
+    if (w == 3 && centre == c80) {
+        uint8_t bands = 0xff;
+        for (uint32_t ch = c80 - 30; ch <= c80 + 30; ch += 20)
+            bands &= ax_freq_bands(pb, ch, 4);
+        /* HT secondary follows the 40 MHz pair containing the primary. */
+        bands &= ax_freq_bands(pb, f, c40 > f ? 1 : 2);
+        bands &= ax_freq_bands(pb, 2 * c40 - f, c40 > f ? 2 : 1);
+        return bands != 0;
+    }
     return 0;
 }
 
@@ -144,6 +168,8 @@ static size_t add_channel_tlvs_cap(uint8_t *b, size_t n, int phy, size_t cap)
             APPEND(f, 1, 0x03, f);
             if (ax_channel_ok(&pb, &pc, f, 1, f))
                 APPEND(f, 1, 0x04, f);
+            if (ax_channel_ok(&pb, &pc, f, 2, c40_for(f)))
+                APPEND(f, 2, 0x04, c40_for(f));
             if (legacy_channel_ok(&pb, f, 0x02, 2, c40_for(f))) {
                 APPEND(f, 2, 0x02, c40_for(f));
                 APPEND(f, 2, 0x03, c40_for(f));
@@ -151,6 +177,8 @@ static size_t add_channel_tlvs_cap(uint8_t *b, size_t n, int phy, size_t cap)
             uint32_t centre = ccfi80(f);
             if (legacy_channel_ok(&pb, f, 0x03, 3, centre))
                 APPEND(f, 3, 0x03, centre);
+            if (ax_channel_ok(&pb, &pc, f, 3, centre))
+                APPEND(f, 3, 0x04, centre);
         } else {                                          /* 6 GHz */
             /* No validated 6 GHz hostapd/manager provisioning path. */
         }
